@@ -1,151 +1,125 @@
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+st.set_page_config(page_title="Memento", page_icon="📊")
+
+st.title("📊 Memento")
+st.write("Polymarket 배팅 가치 판독기 + 거래일지 앱입니다.")
+
+st.header("1. 배팅 가치 판독기")
+
+market_name = st.text_input("시장 이름", "DK vs BRION BO5")
+
+current_price = st.number_input(
+    "현재 가격(센트)",
+    min_value=1.0,
+    max_value=99.0,
+    value=50.0
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+my_probability = st.number_input(
+    "내가 생각하는 실제 승률(%)",
+    min_value=1.0,
+    max_value=99.0,
+    value=60.0
+)
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+stake = st.number_input(
+    "투자금($)",
+    min_value=1.0,
+    value=50.0
+)
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+if st.button("분석하기"):
+    price_decimal = current_price / 100
+    shares = stake / price_decimal
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+    payout_if_win = shares * 1
+    profit_if_win = payout_if_win - stake
+    loss_if_lose = stake
+    edge = my_probability - current_price
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+    st.subheader("분석 결과")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+    st.write(f"시장 이름: {market_name}")
+    st.write(f"시장 implied probability: {current_price:.2f}%")
+    st.write(f"내 예상 승률: {my_probability:.2f}%")
+    st.write(f"Edge: {edge:.2f}%")
+    st.write(f"보유 수량: {shares:.2f}주")
+    st.write(f"승리 시 총 수령액: ${payout_if_win:.2f}")
+    st.write(f"승리 시 순이익: ${profit_if_win:.2f}")
+    st.write(f"패배 시 손실: -${loss_if_lose:.2f}")
+
+    if edge >= 10:
+        st.success("판정: 좋은 value 가능성이 있습니다.")
+    elif edge >= 5:
+        st.info("판정: 소액 진입은 검토 가능합니다.")
+    elif edge >= 0:
+        st.warning("판정: edge가 작습니다. 신중해야 합니다.")
+    else:
+        st.error("판정: 현재 가격은 비싸 보입니다.")
+
+    if current_price >= 90:
+        st.error("주의: 90¢ 이상은 신규 매수보다 익절 구간에 가깝습니다.")
+    elif current_price >= 80:
+        st.warning("주의: 80¢ 이상은 손익비가 나빠질 수 있습니다.")
+    elif current_price <= 10:
+        st.info("주의: 초저가 역배 구간입니다. 소액 bounce trade만 적절합니다.")
+
+
+st.header("2. 거래 손익 계산기")
+
+trade_name = st.text_input("거래 이름", "Anyone's Legend vs BLG Game 1")
+
+buy_price = st.number_input(
+    "매수가(센트)",
+    min_value=1.0,
+    max_value=99.0,
+    value=50.0
+)
+
+sell_price = st.number_input(
+    "매도가(센트)",
+    min_value=0.0,
+    max_value=100.0,
+    value=70.0
+)
+
+trade_stake = st.number_input(
+    "투자금($)",
+    min_value=1.0,
+    value=50.0,
+    key="trade_stake"
+)
+
+if st.button("손익 계산하기"):
+    buy_decimal = buy_price / 100
+    sell_decimal = sell_price / 100
+
+    shares = trade_stake / buy_decimal
+    sell_amount = shares * sell_decimal
+    profit = sell_amount - trade_stake
+    roi = (profit / trade_stake) * 100
+
+    st.subheader("거래 요약")
+
+    st.write(f"거래 이름: {trade_name}")
+    st.write(f"매수가: {buy_price:.2f}¢")
+    st.write(f"매도가: {sell_price:.2f}¢")
+    st.write(f"투자금: ${trade_stake:.2f}")
+    st.write(f"보유 수량: {shares:.2f}주")
+    st.write(f"매도금: ${sell_amount:.2f}")
+    st.write(f"실현손익: ${profit:.2f}")
+    st.write(f"수익률: {roi:.2f}%")
+
+    st.markdown("### 워드 기록용 한 줄 요약")
+
+    summary = (
+        f"{trade_name} / "
+        f"매수가: {buy_price:.2f}¢ / "
+        f"매도가: {sell_price:.2f}¢ / "
+        f"투자금: ${trade_stake:.2f} / "
+        f"실현손익: ${profit:+.2f} / "
+        f"수익률: {roi:+.2f}%"
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    st.write(summary)
