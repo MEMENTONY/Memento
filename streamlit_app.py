@@ -1,4 +1,5 @@
 import json
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -186,6 +187,8 @@ DEFAULTS = {
     "trade_log": [],
     "portfolio": [],
     "cash": 0.0,
+    "deposits": 0.0,          # extra deposits after start capital
+    "withdrawals": 0.0,       # withdrawals taken out of wallet
     "adj_month": 0.0,          # pre-app P&L adjustments
     "adj_year": 0.0,
     "url_rows": [],
@@ -567,15 +570,26 @@ def partial_rows(shares, price_cent, investment):
 # Claude AI
 # =====================================================
 def get_api_key():
-    for fn in (lambda: st.secrets["ANTHROPIC_API_KEY"],
-               lambda: st.secrets["anthropic"]["api_key"],
-               lambda: st.secrets["anthropic"]["ANTHROPIC_API_KEY"]):
-        try:
-            k = str(fn()).strip()
-            if k.startswith("sk-"):
-                return k
-        except Exception:
-            continue
+    """Read Anthropic key safely from Streamlit secrets or local env. Never hard-code the key in app.py."""
+    candidates = []
+    try:
+        candidates.append(st.secrets.get("ANTHROPIC_API_KEY", ""))
+    except Exception:
+        pass
+    try:
+        candidates.append(st.secrets.get("anthropic", {}).get("api_key", ""))
+    except Exception:
+        pass
+    try:
+        candidates.append(st.secrets.get("anthropic", {}).get("ANTHROPIC_API_KEY", ""))
+    except Exception:
+        pass
+    candidates.append(os.getenv("ANTHROPIC_API_KEY", ""))
+
+    for k in candidates:
+        k = str(k).strip().strip('"').strip("'")
+        if k.startswith("sk-ant-") or k.startswith("sk-"):
+            return k
     return None
 
 def build_prompt(team_a, team_b, league, current_price, fair_price, purpose):
@@ -597,6 +611,7 @@ def build_prompt(team_a, team_b, league, current_price, fair_price, purpose):
 5. 팀 변수 — 로스터, 부진 선수, 특이사항
 6. 가격 판단 — {current_price}¢ 배당이 실제 승률 대비 싼지 비싼지
 
+중요: 최신 순위·전적 데이터가 제공되지 않았으면 추측하지 말고 "데이터 없음/직접 확인 필요"라고 쓰세요.
 마지막 줄은 반드시 이 형식으로: 결론: 배팅 추천 / 비추천 / 중립 중 하나
 {lang_line}"""
 
@@ -605,7 +620,7 @@ def call_claude(prompt):
     if not key:
         return None, "no_key"
     try:
-        payload = json.dumps({"model": "claude-sonnet-4-20250514", "max_tokens": 1200,
+        payload = json.dumps({"model": "claude-sonnet-4-6", "max_tokens": 700,
                               "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
         req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload,
                                      headers={"Content-Type": "application/json", "x-api-key": key,
@@ -614,7 +629,11 @@ def call_claude(prompt):
             data = json.loads(r.read().decode("utf-8"))
             return data["content"][0]["text"], None
     except urllib.error.HTTPError as e:
-        return None, f"http_{e.code}"
+        try:
+            body = e.read().decode("utf-8", "ignore")[:500]
+        except Exception:
+            body = ""
+        return None, f"http_{e.code}: {body}"
     except Exception as e:
         return None, str(e)
 
@@ -731,6 +750,73 @@ def period_pnl():
         if dt.year == now.year and dt.month == now.month: m += p
         if dt.year == now.year: y += p
     return w, m + st.session_state.adj_month, y + st.session_state.adj_year
+
+
+def portfolio_health(portfolio, cash):
+    """Analyze current holdings using only existing portfolio rows. No extra manual inputs."""
+    g, c1, c2, blk = size_thresholds()
+    pos_value = sum((p.get("shares", 0) or 0) * ((p.get("cur", 0) or 0) / 100) for p in portfolio)
+    pos_cost = sum((p.get("inv", 0) or 0) for p in portfolio)
+    total_assets = cash + pos_value
+    unrealized = pos_value - pos_cost
+    unrealized_pct = unrealized / pos_cost * 100 if pos_cost else 0
+    exposure_pct = pos_value / total_assets * 100 if total_assets else 0
+    cash_pct = cash / total_assets * 100 if total_assets else 0
+
+    rows, values = [], []
+    for p in portfolio:
+        sh = p.get("shares", 0) or 0
+        cur = p.get("cur", 0) or 0
+        inv = p.get("inv", 0) or 0
+        val = sh * cur / 100
+        pnl = val - inv
+        roi = pnl / inv * 100 if inv else 0
+        pct = val / total_assets * 100 if total_assets else 0
+        values.append({"name": p.get("name", ""), "val": val, "pct": pct, "cur": cur, "roi": roi, "pnl": pnl})
+
+    if not portfolio:
+        return {"title": t("분석할 보유 포지션이 없습니다", "No holdings to analyze"), "kind": "i",
+                "summary": t("지갑에서 포지션을 불러오거나 직접 추가하면 자동 분석이 표시됩니다.", "Import or add positions to see analysis."),
+                "lines": [], "exposure_pct": 0, "cash_pct": 100, "unrealized": 0, "unrealized_pct": 0}
+
+    biggest = max(values, key=lambda x: x["val"]) if values else {"name": "", "pct": 0, "val": 0, "cur": 0, "roi": 0}
+    losers = [x for x in values if x["roi"] <= -8]
+    high_price = [x for x in values if x["cur"] >= 85]
+    lottery = [x for x in values if x["cur"] <= 5]
+
+    kind = "g"
+    title = t("보유 상황 양호", "Holdings look controlled")
+    summary = t("현재 포지션 규모가 개인 리스크 기준 안에서 관리 가능한 편입니다.", "Current position sizes look manageable within your risk profile.")
+
+    if biggest["pct"] >= blk:
+        kind, title = "b", t("단일 포지션 과대", "Single position too large")
+        summary = t(f"가장 큰 포지션이 총자산의 {biggest['pct']:.1f}%입니다. 내 진입 금지선 {blk:.0f}%를 넘었습니다.",
+                    f"Largest position is {biggest['pct']:.1f}% of assets, above your no-entry line {blk:.0f}%.")
+    elif exposure_pct >= min(blk * 2, 50):
+        kind, title = "b", t("전체 노출 과대", "Total exposure too high")
+        summary = t(f"보유 포지션 평가금이 총자산의 {exposure_pct:.1f}%입니다. 신규 진입보다 축소·관망이 우선입니다.",
+                    f"Open positions are {exposure_pct:.1f}% of assets. Reduce/watch before adding.")
+    elif biggest["pct"] >= c1 or len(losers) >= 2 or high_price:
+        kind, title = "w", t("주의 필요", "Needs caution")
+        summary = t("일부 포지션의 크기·가격대·손실률을 점검해야 합니다.", "Review size, price zone, or loss rate on some positions.")
+
+    rows.append((kind, summary))
+    rows.append(("w" if biggest["pct"] >= c1 else "g",
+                 t(f"최대 포지션: {biggest['name']} · {money(biggest['val'])} · 총자산의 {biggest['pct']:.1f}%",
+                   f"Largest: {biggest['name']} · {money(biggest['val'])} · {biggest['pct']:.1f}% of assets")))
+    rows.append(("g" if unrealized >= 0 else "b",
+                 t(f"미실현손익: {signed_money(unrealized)} ({signed_pct(unrealized_pct)})",
+                   f"Unrealized P&L: {signed_money(unrealized)} ({signed_pct(unrealized_pct)})")))
+    rows.append(("w" if high_price else "g",
+                 t(f"85¢ 이상 고가 포지션: {len(high_price)}개 — 고가 구간은 신규매수보다 익절/축소 판단이 우선입니다.",
+                   f"High-price positions 85¢+: {len(high_price)} — prefer take-profit/reduce checks over new buys.")))
+    rows.append(("w" if lottery else "g",
+                 t(f"5¢ 이하 복권형 포지션: {len(lottery)}개 — 추가매수 금지 원칙이 좋습니다.",
+                   f"Lottery-like positions ≤5¢: {len(lottery)} — no-add rule is safer.")))
+
+    return {"title": title, "kind": kind, "summary": summary, "lines": rows,
+            "exposure_pct": exposure_pct, "cash_pct": cash_pct,
+            "unrealized": unrealized, "unrealized_pct": unrealized_pct}
 
 
 # =====================================================
@@ -1296,6 +1382,14 @@ with tab_pf:
     cash = st.number_input(t("현금 잔고 (USDC, $)", "Cash balance (USDC, $)"), 0.0, value=float(st.session_state.cash), key="cash_input")
     st.session_state.cash = cash
 
+    with st.expander(t("입출금 보정", "Deposit / withdrawal adjustment")):
+        st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("출금하면 지갑 자산은 줄어도 실제 번 돈은 사라진 게 아닙니다. 시작 자금 이후 추가 입금/출금을 넣으면 보정 후 실제 성과를 계산합니다.", "Withdrawals lower wallet assets, but not real profit. Enter deposits/withdrawals after the starting capital to calculate adjusted performance.")}</div>', unsafe_allow_html=True)
+        cf1, cf2 = st.columns(2)
+        with cf1:
+            st.session_state.deposits = st.number_input(t("시작 이후 추가 입금 총액 ($)", "Extra deposits after start ($)"), 0.0, value=float(st.session_state.deposits))
+        with cf2:
+            st.session_state.withdrawals = st.number_input(t("시작 이후 출금 총액 ($)", "Withdrawals after start ($)"), 0.0, value=float(st.session_state.withdrawals))
+
     st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("보유 포지션", "Open positions")}</div>', unsafe_allow_html=True)
     if st.session_state.portfolio:
         df = pd.DataFrame(st.session_state.portfolio)
@@ -1354,6 +1448,11 @@ with tab_pf:
     realized_total = sum(tr["profit"] for tr in st.session_state.trade_log) + st.session_state.adj_year
     total_pnl = unrealized + realized_total
     total_roi = total_pnl / sc * 100 if sc else 0
+    deposits = st.session_state.deposits
+    withdrawals = st.session_state.withdrawals
+    flow_adjusted_pnl = total_assets + withdrawals - deposits - sc
+    flow_adjusted_roi = flow_adjusted_pnl / sc * 100 if sc else 0
+    wallet_gap = flow_adjusted_pnl - (total_assets - sc)
 
     st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("자산 현황", "Assets")}</div>', unsafe_allow_html=True)
     st.markdown(
@@ -1368,6 +1467,11 @@ with tab_pf:
         + stat(t("미실현손익", "Unrealized"), signed_money(unrealized), "", "pos" if unrealized >= 0 else "neg")
         + stat(t("총 손익", "Total P&L"), signed_money(total_pnl), "", "pos" if total_pnl >= 0 else "neg")
         + stat(t("총 수익률", "Total ROI"), signed_pct(total_roi), t(f"시작 {money(sc)}", f"Start {money(sc)}"), "pos" if total_roi >= 0 else "neg")
+        + "</div>"
+        + '<div class="stats three">'
+        + stat(t("입출금 보정 실제손익", "Flow-adjusted P&L"), signed_money(flow_adjusted_pnl), t(f"출금 {money(withdrawals)} · 추가입금 {money(deposits)}", f"Withdrawn {money(withdrawals)} · Deposited {money(deposits)}"), "pos" if flow_adjusted_pnl >= 0 else "neg")
+        + stat(t("보정 후 수익률", "Adjusted ROI"), signed_pct(flow_adjusted_roi), t(f"시작 {money(sc)} 기준", f"vs start {money(sc)}"), "pos" if flow_adjusted_roi >= 0 else "neg")
+        + stat(t("지갑-성과 차이", "Wallet-performance gap"), signed_money(wallet_gap), t("출금/추가입금 때문에 생긴 차이", "Difference caused by withdrawals/deposits"), "pos" if wallet_gap >= 0 else "neg")
         + "</div>", unsafe_allow_html=True)
 
     def pos_status(pct):
@@ -1394,6 +1498,24 @@ with tab_pf:
     if pos_rows:
         st.markdown(f'<div class="eyebrow">{t("포지션별 손익", "Per-position P&L")}</div>', unsafe_allow_html=True)
         st.markdown('<div class="spec">' + "".join(pos_rows) + '</div>', unsafe_allow_html=True)
+
+    # ---- automatic portfolio analysis ----
+    ph = portfolio_health(st.session_state.portfolio, cash)
+    st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("보유 포지션 자동 분석", "Automatic holdings analysis")}</div>', unsafe_allow_html=True)
+    ph_html = (
+        f'<div class="verdict" style="padding-top:14px;">'
+        f'<div class="v-title" style="font-size:30px;"><span class="dot {ph["kind"]}"></span>{ph["title"]}</div>'
+        f'<div class="v-sub">{ph["summary"]}</div></div>'
+    )
+    st.markdown(ph_html, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="stats three">'
+        + stat(t("전체 포지션 노출", "Total exposure"), f"{ph['exposure_pct']:.1f}%", t("평가금 / 총자산", "Value / assets"), "neg" if ph['exposure_pct'] >= blk_ else "")
+        + stat(t("현금 비중", "Cash ratio"), f"{ph['cash_pct']:.1f}%", t("현금 / 총자산", "Cash / assets"))
+        + stat(t("미실현손익", "Unrealized"), signed_money(ph['unrealized']), signed_pct(ph['unrealized_pct']), "pos" if ph['unrealized'] >= 0 else "neg")
+        + "</div>", unsafe_allow_html=True)
+    if ph["lines"]:
+        st.markdown("".join(line(txt, kk) for kk, txt in ph["lines"]), unsafe_allow_html=True)
 
     # ---- realized P&L by period with adjustments ----
     st.markdown(f'<div class="eyebrow">{t("실현손익", "Realized P&L")}</div>', unsafe_allow_html=True)
@@ -1422,6 +1544,19 @@ with tab_pf:
 # =====================================================
 with tab_set:
     st.markdown(f'<div class="headline">{t("설정 · 도구", "Settings · tools")}</div>', unsafe_allow_html=True)
+
+    # ---- Claude API test ----
+    st.markdown(f'<div class="eyebrow">{t("Claude API 상태", "Claude API status")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("API 키는 코드에 직접 넣지 말고 Streamlit Secrets의 ANTHROPIC_API_KEY에 저장하세요.", "Do not hard-code keys. Save it as ANTHROPIC_API_KEY in Streamlit Secrets.")}</div>', unsafe_allow_html=True)
+    if st.button(t("Claude API 연결 테스트", "Test Claude API"), use_container_width=True):
+        test_text, test_err = call_claude(t("한 문장으로 '연결 성공'이라고 답해.", "Reply with one sentence: connection successful."))
+        if test_err:
+            st.markdown(line(t(f"Claude API 실패 — {test_err}", f"Claude API failed — {test_err}"), "b"), unsafe_allow_html=True)
+        else:
+            st.markdown(line(t("Claude API 연결 성공", "Claude API connection successful"), "g"), unsafe_allow_html=True)
+            st.caption(test_text)
+
+    st.markdown("<hr>", unsafe_allow_html=True)
 
     # ---- risk profile ----
     st.markdown(f'<div class="eyebrow">{t("내 리스크 프로필", "My risk profile")}</div>', unsafe_allow_html=True)
@@ -1482,6 +1617,7 @@ with tab_set:
     bc1, bc2 = st.columns(2)
     with bc1:
         backup = {"profile": st.session_state.profile, "cash": st.session_state.cash,
+                  "deposits": st.session_state.deposits, "withdrawals": st.session_state.withdrawals,
                   "portfolio": st.session_state.portfolio, "trade_log": st.session_state.trade_log,
                   "adj_month": st.session_state.adj_month, "adj_year": st.session_state.adj_year,
                   "reviews": st.session_state.reviews}
@@ -1495,6 +1631,8 @@ with tab_set:
                 data = json.loads(up.read().decode("utf-8"))
                 st.session_state.profile = data.get("profile") or st.session_state.profile
                 st.session_state.cash = float(data.get("cash", 0))
+                st.session_state.deposits = float(data.get("deposits", 0))
+                st.session_state.withdrawals = float(data.get("withdrawals", 0))
                 st.session_state.portfolio = data.get("portfolio", [])
                 st.session_state.trade_log = data.get("trade_log", [])
                 st.session_state.adj_month = float(data.get("adj_month", 0))
