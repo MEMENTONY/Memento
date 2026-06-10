@@ -144,16 +144,15 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 26px 0; }
 /* meter with verdict pill */
 .meter { margin: 16px 0; }
 .meter .m-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
-.meter .m-label { font-size: 13.5px; color: var(--ink2); font-weight: 500; }
+.meter .m-label { font-size: 13.5px; color: var(--ink2); font-weight: 600; }
 .meter .m-right { display: flex; gap: 10px; align-items: baseline; }
-.meter .m-num { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.meter .m-num { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .meter .m-num.g { color: var(--green); } .meter .m-num.w { color: var(--amber); }
 .meter .m-num.b { color: var(--red); } .meter .m-num.i { color: var(--ink); }
 .meter .m-track { height: 5px; border-radius: 980px; background: var(--hairline); overflow: hidden; }
 .meter .m-fill { height: 100%; border-radius: 980px; }
-.meter .m-label { font-weight: 600; }
 .meter .state { font-size: 12.5px; padding: 4px 12px; font-weight: 600; }
-.meter .m-num { font-size: 16px; }
+
 .quiet { border: 1px dashed var(--hairline); border-radius: 16px; padding: 58px 24px; text-align: center; }
 .quiet .q-title { font-size: 16px; font-weight: 600; }
 .quiet .q-body { margin-top: 8px; font-size: 13.5px; color: var(--gray); line-height: 1.65; }
@@ -713,6 +712,8 @@ def is_open_position(it):
     if cur <= 0.001 or cur >= 0.999:
         return False
     return True
+
+
 # =====================================================
 # Period P&L
 # =====================================================
@@ -1218,7 +1219,7 @@ with tab4:
     else:
         st.markdown(f'<div class="footnote">{t("아직 기록된 거래가 없습니다.", "No trades yet.")}</div>', unsafe_allow_html=True)
 
-   with st.expander(t("거래 복기", "Trade review")):
+    with st.expander(t("거래 복기", "Trade review")):
         with st.form("review_form"):
             rv_name = st.text_input(t("어떤 거래?", "Which trade?"),
                 st.session_state.trade_log[-1]["name"] if st.session_state.trade_log else "")
@@ -1249,6 +1250,7 @@ with tab4:
 
         if st.session_state.reviews:
             st.dataframe(pd.DataFrame(st.session_state.reviews), use_container_width=True, hide_index=True)
+
 
 # =====================================================
 # Tab 5 — Portfolio (now last among data tabs)
@@ -1479,7 +1481,7 @@ with tab_set:
     st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("새로고침하면 데이터가 사라집니다. 백업을 내려받아 두세요. 프로필도 함께 저장됩니다.", "Data is lost on refresh. Download a backup — your profile is included.")}</div>', unsafe_allow_html=True)
     bc1, bc2 = st.columns(2)
     with bc1:
-   backup = {"profile": st.session_state.profile, "cash": st.session_state.cash,
+        backup = {"profile": st.session_state.profile, "cash": st.session_state.cash,
                   "portfolio": st.session_state.portfolio, "trade_log": st.session_state.trade_log,
                   "adj_month": st.session_state.adj_month, "adj_year": st.session_state.adj_year,
                   "reviews": st.session_state.reviews}
