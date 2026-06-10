@@ -9,10 +9,10 @@ import streamlit as st
 
 
 # =====================================================
-# Memento Grandmaster
+# Memento
 # =====================================================
 st.set_page_config(
-    page_title="Memento Grandmaster",
+    page_title="Memento",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -26,13 +26,13 @@ st.markdown(
     """
 <style>
 :root {
-  --bg: #f5f7fb;
+  --bg: #f5f5f7;
   --paper: #ffffff;
-  --paper2: #f8fafc;
-  --ink: #0f172a;
-  --muted: #64748b;
-  --line: #e2e8f0;
-  --line2: #cbd5e1;
+  --paper2: #fbfbfd;
+  --ink: #1d1d1f;
+  --muted: #6e6e73;
+  --line: #d2d2d7;
+  --line2: #c7c7cc;
   --green: #00a76f;
   --green-bg: #e8fff5;
   --red: #ef4444;
@@ -47,16 +47,13 @@ st.markdown(
 }
 
 html, body, .stApp {
-  background:
-    radial-gradient(circle at 5% 0%, rgba(0,167,111,.10), transparent 26%),
-    radial-gradient(circle at 100% 10%, rgba(37,99,235,.10), transparent 22%),
-    linear-gradient(180deg, #ffffff 0%, #f5f7fb 45%, #f7f8fb 100%) !important;
+  background: #f5f5f7 !important;
   color: var(--ink) !important;
 }
 
 .block-container {
-  max-width: 1360px;
-  padding-top: 1.1rem;
+  max-width: 1180px;
+  padding-top: 1.6rem;
   padding-bottom: 4rem;
 }
 
@@ -152,63 +149,58 @@ div[data-testid="stMetricValue"] {
 .hero {
   position: relative;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 10% 15%, rgba(0,167,111,.16), transparent 26%),
-    radial-gradient(circle at 90% 10%, rgba(37,99,235,.16), transparent 25%),
-    linear-gradient(135deg, #ffffff 0%, #f8fafc 48%, #eef6ff 100%);
-  border: 1px solid var(--line);
-  border-radius: 34px;
-  padding: 30px;
-  box-shadow: 0 24px 70px rgba(15,23,42,.09);
-  margin-bottom: 18px;
+  background: #ffffff;
+  border: 1px solid rgba(0,0,0,.06);
+  border-radius: 36px;
+  padding: 46px 36px 42px;
+  box-shadow: 0 16px 46px rgba(0,0,0,.055);
+  margin-bottom: 22px;
+  text-align: center;
 }
 
 .hero:after {
   content: "";
   position: absolute;
-  right: -80px;
-  top: -80px;
-  width: 240px;
-  height: 240px;
-  border-radius: 999px;
-  background: rgba(0,167,111,.09);
-  border: 1px solid rgba(0,167,111,.14);
+  inset: auto 16% -72px 16%;
+  height: 140px;
+  background: radial-gradient(ellipse at center, rgba(0,113,227,.14), transparent 68%);
+  pointer-events: none;
 }
 
 .brand-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   gap: 18px;
 }
 
 .brand-title {
-  font-size: 46px;
+  font-size: 64px;
   line-height: .95;
-  letter-spacing: -1.8px;
-  font-weight: 1000;
-  color: #020617;
+  letter-spacing: -3.2px;
+  font-weight: 900;
+  color: #1d1d1f;
 }
 
 .brand-sub {
-  margin-top: 10px;
-  color: #475569;
-  line-height: 1.65;
-  font-size: 15px;
+  margin-top: 14px;
+  color: #6e6e73;
+  line-height: 1.45;
+  font-size: 21px;
+  font-weight: 500;
 }
 
 .status-chip {
   display:inline-block;
   border-radius: 999px;
-  padding: 7px 12px;
-  background: #ffffff;
-  border: 1px solid var(--line);
-  color: #334155;
+  padding: 7px 13px;
+  background: #f5f5f7;
+  border: 1px solid rgba(0,0,0,.06);
+  color: #424245;
   font-size: 12px;
-  font-weight: 850;
+  font-weight: 700;
   margin-right: 6px;
-  margin-top: 14px;
-  box-shadow: 0 4px 14px rgba(15,23,42,.04);
+  margin-top: 18px;
 }
 
 .command-strip {
@@ -253,9 +245,9 @@ div[data-testid="stMetricValue"] {
 .card {
   background: #ffffff;
   border: 1px solid var(--line);
-  border-radius: 24px;
+  border-radius: 28px;
   padding: 20px;
-  box-shadow: 0 14px 42px rgba(15,23,42,.06);
+  box-shadow: 0 10px 30px rgba(0,0,0,.045);
   margin-bottom: 16px;
 }
 
@@ -282,10 +274,10 @@ div[data-testid="stMetricValue"] {
 }
 
 .result {
-  border-radius: 30px;
+  border-radius: 32px;
   padding: 24px;
   border: 1px solid var(--line);
-  box-shadow: 0 22px 56px rgba(15,23,42,.08);
+  box-shadow: 0 18px 42px rgba(0,0,0,.055);
   margin: 10px 0 18px 0;
 }
 
@@ -481,7 +473,7 @@ div[data-testid="stMetricValue"] {
   border:1px solid var(--line);
   border-radius: 28px;
   padding: 20px;
-  box-shadow: 0 14px 42px rgba(15,23,42,.06);
+  box-shadow: 0 10px 30px rgba(0,0,0,.045);
 }
 
 .ai-empty {
@@ -649,6 +641,13 @@ def report_card(title, badge, kind, body):
       <div class="report-body">{body}</div>
     </div>
     """
+
+
+def native_score_bar(label, value, max_value=100, caption=""):
+    safe = 0 if value is None else max(0, min(float(value), float(max_value)))
+    ratio = safe / max_value if max_value else 0
+    st.caption(f"{label}: {value:.1f}{caption}")
+    st.progress(ratio)
 
 
 def result_class(level):
@@ -1170,15 +1169,12 @@ def render_entry_result(r):
         unsafe_allow_html=True,
     )
 
-    st.markdown(
-        "<div class='card'><div class='section-title'>점수 보드</div>"
-        + bar("리스크 포함 최종 적절성", r["final_score"], 100, score_color(r["final_score"]), "%")
-        + bar("배팅 규모 제외 순수 가치", r["value_score"], 100, "#2563eb", "%")
-        + bar("포트폴리오 사용 비중", min(r["position_pct"], 100), 100, "#ef4444" if r["position_pct"] >= 20 else "#f59e0b" if r["position_pct"] >= 5 else "#00a76f", "%")
-        + bar("현재가 위치", r["current_price"], 100, "#64748b", "¢")
-        + "</div>",
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        st.markdown("#### 점수 보드")
+        native_score_bar("리스크 포함 최종 적절성", r["final_score"], 100, "%")
+        native_score_bar("배팅 규모 제외 순수 가치", r["value_score"], 100, "%")
+        native_score_bar("포트폴리오 사용 비중", min(r["position_pct"], 100), 100, "%")
+        native_score_bar("현재가 위치", r["current_price"], 100, "¢")
 
     left, right = st.columns(2)
     with left:
@@ -1289,14 +1285,11 @@ def render_position_result(r):
         unsafe_allow_html=True,
     )
 
-    st.markdown(
-        "<div class='card'><div class='section-title'>포지션 위험 시각화</div>"
-        + bar("현재 수익률", max(r["roi"], 0), 100, "#00a76f" if r["roi"] >= 0 else "#ef4444", "%")
-        + bar("포트폴리오 비중", min(r["position_pct"], 100), 100, "#ef4444" if r["position_pct"] >= 20 else "#f59e0b" if r["position_pct"] >= 10 else "#00a76f", "%")
-        + bar("현재가 위치", r["current_price"], 100, "#2563eb", "¢")
-        + "</div>",
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        st.markdown("#### 포지션 위험 시각화")
+        native_score_bar("현재 수익률", max(r["roi"], 0), 100, "%")
+        native_score_bar("포트폴리오 비중", min(r["position_pct"], 100), 100, "%")
+        native_score_bar("현재가 위치", r["current_price"], 100, "¢")
 
     left, right = st.columns(2)
     with left:
@@ -1327,15 +1320,12 @@ st.markdown(
     <div class="hero">
       <div class="brand-row">
         <div>
-          <div class="brand-title">Memento<br>Grandmaster</div>
-          <div class="brand-sub">
-            Polymarket 배팅 판단 도구 · 계좌를 지키는 수동 리스크 관리 앱<br>
-            <b>좋은 팀이 아니라 좋은 가격을 산다. Edge가 좋아도 금액이 과하면 나쁜 거래다.</b>
-          </div>
-          <span class="status-chip">⚡ Entry Command</span>
-          <span class="status-chip">📍 Position Studio</span>
-          <span class="status-chip">🧩 Partial Exit</span>
-          <span class="status-chip">🔎 URL Helper</span>
+          <div class="brand-title">Memento</div>
+          <div class="brand-sub">Betting Value Studio</div>
+          <span class="status-chip">Entry</span>
+          <span class="status-chip">Position</span>
+          <span class="status-chip">Partial Exit</span>
+          <span class="status-chip">Journal</span>
         </div>
       </div>
     </div>
