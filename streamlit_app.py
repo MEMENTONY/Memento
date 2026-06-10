@@ -151,7 +151,9 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 26px 0; }
 .meter .m-num.b { color: var(--red); } .meter .m-num.i { color: var(--ink); }
 .meter .m-track { height: 5px; border-radius: 980px; background: var(--hairline); overflow: hidden; }
 .meter .m-fill { height: 100%; border-radius: 980px; }
-
+.meter .m-label { font-weight: 600; }
+.meter .state { font-size: 12.5px; padding: 4px 12px; font-weight: 600; }
+.meter .m-num { font-size: 16px; }
 .quiet { border: 1px dashed var(--hairline); border-radius: 16px; padding: 58px 24px; text-align: center; }
 .quiet .q-title { font-size: 16px; font-weight: 600; }
 .quiet .q-body { margin-top: 8px; font-size: 13.5px; color: var(--gray); line-height: 1.65; }
@@ -189,6 +191,8 @@ DEFAULTS = {
     "adj_year": 0.0,
     "url_rows": [],
     "ai_text": "", "ai_error": "", "ai_prompt": "", "ai_pair": "",
+    "wallet_raw": [],
+    "reviews": [],
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -691,6 +695,24 @@ def fetch_wallet_positions(addr):
         return json.loads(r.read().decode("utf-8"))
 
 
+MIN_SHARES = 1.0   # 이 미만 수량은 dust로 간주
+MIN_VALUE = 1.0    # 평가금 $1 미만은 숨김
+
+def is_open_position(it):
+    """현재 실제 보유 중인 포지션인지 판단"""
+    try:
+        size = float(it.get("size", 0))
+        cur = float(it.get("curPrice", 0))
+        val = float(it.get("currentValue", size * cur))
+    except Exception:
+        return False
+    if it.get("redeemable") is True:
+        return False
+    if size < MIN_SHARES or val < MIN_VALUE:
+        return False
+    if cur <= 0.001 or cur >= 0.999:
+        return False
+    return True
 # =====================================================
 # Period P&L
 # =====================================================
@@ -794,12 +816,16 @@ if st.session_state.profile is None:
 # profile summary chip under masthead
 prof = profile()
 g_, c1_, c2_, blk_ = size_thresholds()
+eb_ = effective_bankroll()
+exp_limit_ = min(blk_ * 2, 50)
 st.markdown(
     f'<div class="footnote" style="margin:-2px 0 14px 0;">'
-    f'{t("내 리스크 기준", "My risk profile")} · '
-    f'{t("적정", "comfort")} {g_:.0f}% · {t("진입 금지", "block")} {blk_:.0f}% · '
-    f'{t("감정 한도", "emotional cap")} {money(prof["emotional_limit"])} · '
-    f'{t("설정 탭에서 변경 가능", "editable in Settings")}</div>',
+    f'{t("내 리스크 기준", "My limits")} · '
+    f'{t("적정", "comfort")} {g_:.0f}% ({money(eb_*g_/100)}) · '
+    f'{t("최대", "max")} {c1_:.0f}% ({money(eb_*c1_/100)}) · '
+    f'{t("진입 금지", "block")} {blk_:.0f}% ({money(eb_*blk_/100)}) · '
+    f'{t("전체 노출 한도", "total exposure")} {exp_limit_:.0f}% ({money(eb_*exp_limit_/100)}) · '
+    f'{t("감정 한도", "cap")} {money(prof["emotional_limit"])}</div>',
     unsafe_allow_html=True)
 
 tab1, tab2, tab3, tab4, tab_pf, tab_set = st.tabs([
@@ -1192,17 +1218,37 @@ with tab4:
     else:
         st.markdown(f'<div class="footnote">{t("아직 기록된 거래가 없습니다.", "No trades yet.")}</div>', unsafe_allow_html=True)
 
-    with st.expander(t("거래 복기 질문", "Review questions")):
-        qs_list = [t("원하는 가격에 진입했는가?", "Did I enter at my price?"),
-                   t("내 예상 승률의 근거는 무엇인가?", "What grounds my estimate?"),
-                   t("북메이커와 왜 다르게 봤는가?", "Why differ from bookmakers?"),
-                   t("금액은 감당 가능한 크기였는가?", "Was the size affordable?"),
-                   t("매도 기준을 지켰는가?", "Did I follow exit rules?"),
-                   t("감정적으로 들어간 부분이 있었는가?", "Was any part emotional?"),
-                   t("다음에 반복 가능한 거래인가?", "Is this repeatable?"),
-                   t("놓친 수익을 손실로 착각하고 있지는 않은가?", "Confusing missed profit with loss?")]
-        st.markdown("".join(line(q, "i") for q in qs_list), unsafe_allow_html=True)
+   with st.expander(t("거래 복기", "Trade review")):
+        with st.form("review_form"):
+            rv_name = st.text_input(t("어떤 거래?", "Which trade?"),
+                st.session_state.trade_log[-1]["name"] if st.session_state.trade_log else "")
+            r1, r2 = st.columns(2)
+            with r1:
+                rv_plan = st.radio(t("계획대로 진입했는가?", "Entered as planned?"), ["Yes", "No"], horizontal=True)
+                rv_stop = st.radio(t("손절 기준을 지켰는가?", "Followed stop rule?"), ["Yes", "No"], horizontal=True)
+            with r2:
+                rv_emo = st.radio(t("감정적으로 진입했는가?", "Entered emotionally?"), ["No", "Yes"], horizontal=True)
+                rv_tp = st.radio(t("익절 기준을 지켰는가?", "Followed TP rule?"), ["Yes", "No"], horizontal=True)
+            rv_reason = st.text_area(t("진입 이유", "Why did you enter?"), height=70)
+            rv_one = st.text_input(t("결과 한 줄 복기", "One-line review"))
+            rv_fix = st.text_input(t("다음 거래에서 고칠 점", "Fix for next trade"))
+            rv_save = st.form_submit_button(t("복기 저장", "Save review"), use_container_width=True)
 
+        if rv_save:
+            st.session_state.reviews.append({
+                t("날짜", "Date"): date.today().isoformat(),
+                t("거래", "Trade"): rv_name,
+                t("계획 진입", "Planned"): rv_plan,
+                t("감정 진입", "Emotional"): rv_emo,
+                t("손절 준수", "Stop kept"): rv_stop,
+                t("익절 준수", "TP kept"): rv_tp,
+                t("진입 이유", "Reason"): rv_reason,
+                t("복기", "Review"): rv_one,
+                t("개선점", "Fix"): rv_fix})
+            st.toast(t("저장했습니다", "Saved"))
+
+        if st.session_state.reviews:
+            st.dataframe(pd.DataFrame(st.session_state.reviews), use_container_width=True, hide_index=True)
 
 # =====================================================
 # Tab 5 — Portfolio (now last among data tabs)
@@ -1216,32 +1262,34 @@ with tab_pf:
         st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("폴리마켓 프로필 주소(0x로 시작)를 붙여넣으면 공개 데이터 API로 보유 포지션을 읽어옵니다. 로그인·서명 없이 조회만 합니다.", "Paste your Polymarket profile address (starts with 0x). We read your open positions via the public data API — read-only, no login or signing.")}</div>', unsafe_allow_html=True)
         addr = st.text_input(t("지갑 주소", "Wallet address"), "", placeholder="0x...")
         if st.button(t("불러오기", "Import"), use_container_width=True):
-            if not addr.strip().startswith("0x"):
-                st.markdown(line(t("0x로 시작하는 주소를 입력해주세요.", "Address must start with 0x."), "w"), unsafe_allow_html=True)
+            a = addr.strip()
+            if not (a.startswith("0x") and len(a) == 42):
+                st.markdown(line(t("주소 형식 오류 — 0x로 시작하는 42자 주소인지 확인하세요.", "Bad address — must be 42 chars starting with 0x."), "b"), unsafe_allow_html=True)
             else:
                 try:
-                    with st.spinner(t("폴리마켓에서 불러오는 중", "Fetching from Polymarket")):
-                        items = fetch_wallet_positions(addr.strip())
-                    imported = 0
-                    for it in items if isinstance(items, list) else []:
-                        try:
-                            st.session_state.portfolio.append(dict(
-                                name=it.get("title") or it.get("slug") or "Polymarket position",
-                                outcome=it.get("outcome", ""),
-                                buy=round(float(it.get("avgPrice", 0)) * 100, 1),
-                                shares=round(float(it.get("size", 0)), 2),
-                                inv=round(float(it.get("initialValue", 0)), 2),
-                                cur=round(float(it.get("curPrice", 0)) * 100, 1)))
-                            imported += 1
-                        except Exception:
-                            continue
-                    if imported:
-                        st.toast(t(f"{imported}개 포지션을 불러왔습니다", f"Imported {imported} positions"))
-                        st.rerun()
-                    else:
-                        st.markdown(line(t("열린 포지션을 찾지 못했습니다.", "No open positions found."), "w"), unsafe_allow_html=True)
+                    with st.spinner(t("폴리마켓에서 불러오는 중", "Fetching")):
+                        items = fetch_wallet_positions(a)
+                    st.session_state.wallet_raw = items
+                    open_items = [it for it in items if is_open_position(it)] if isinstance(items, list) else []
+                    st.session_state.portfolio = [dict(
+                        name=it.get("title") or "Polymarket position",
+                        outcome=it.get("outcome", ""),
+                        buy=round(float(it.get("avgPrice", 0)) * 100, 1),
+                        shares=round(float(it.get("size", 0)), 2),
+                        inv=round(float(it.get("initialValue", 0)), 2),
+                        cur=round(float(it.get("curPrice", 0)) * 100, 1),
+                    ) for it in open_items]
+                    st.toast(t(f"보유 포지션 {len(open_items)}개", f"{len(open_items)} open positions"))
+                    st.rerun()
+                except urllib.error.HTTPError as e:
+                    st.markdown(line(t(f"연결 실패 (HTTP {e.code}) — 주소 확인 필요", f"Failed (HTTP {e.code}) — check address"), "b"), unsafe_allow_html=True)
+                except urllib.error.URLError:
+                    st.markdown(line(t("응답 없음 — 잠시 후 다시 시도하세요.", "No response — try again later."), "b"), unsafe_allow_html=True)
                 except Exception as e:
                     st.markdown(line(t(f"불러오기 실패 — {e}", f"Import failed — {e}"), "b"), unsafe_allow_html=True)
+
+    with st.expander(t("디버그 — raw API 응답 보기", "Debug — raw API response")):
+        st.json(st.session_state.wallet_raw)
 
     cash = st.number_input(t("현금 잔고 (USDC, $)", "Cash balance (USDC, $)"), 0.0, value=float(st.session_state.cash), key="cash_input")
     st.session_state.cash = cash
@@ -1301,15 +1349,49 @@ with tab_pf:
     g_tone = "pos" if growth >= 0 else "neg"
     u_tone = "pos" if unrealized >= 0 else "neg"
 
+    realized_total = sum(tr["profit"] for tr in st.session_state.trade_log) + st.session_state.adj_year
+    total_pnl = unrealized + realized_total
+    total_roi = total_pnl / sc * 100 if sc else 0
+
     st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("자산 현황", "Assets")}</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="stats">'
-        + stat(t("총자산", "Total assets"), money(total_assets), t("현금 + 포지션", "Cash + positions"))
-        + stat(t("시작 자금 대비", "Growth vs start"), signed_pct(growth), t(f"시작 {money(sc)}", f"Started {money(sc)}"), g_tone)
-        + stat(t("평가손익", "Unrealized P&L"), signed_money(unrealized),
-               signed_pct(unrealized / pos_cost * 100) if pos_cost else "—", u_tone)
-        + stat(t("현금", "Cash"), money(cash), "USDC")
+        + stat(t("현재 총자산", "Total assets"), money(total_assets), t("현금 + 평가금", "Cash + value"))
+        + stat(t("총 투자금", "Total invested"), money(pos_cost), "")
+        + stat(t("현재 평가금액", "Current value"), money(pos_value), "")
+        + stat(t("보유 포지션", "Open positions"), f"{len(st.session_state.portfolio)}", "")
+        + "</div>"
+        + '<div class="stats">'
+        + stat(t("실현손익", "Realized"), signed_money(realized_total), "", "pos" if realized_total >= 0 else "neg")
+        + stat(t("미실현손익", "Unrealized"), signed_money(unrealized), "", "pos" if unrealized >= 0 else "neg")
+        + stat(t("총 손익", "Total P&L"), signed_money(total_pnl), "", "pos" if total_pnl >= 0 else "neg")
+        + stat(t("총 수익률", "Total ROI"), signed_pct(total_roi), t(f"시작 {money(sc)}", f"Start {money(sc)}"), "pos" if total_roi >= 0 else "neg")
         + "</div>", unsafe_allow_html=True)
+
+    def pos_status(pct):
+        if pct >= 2: return t("이익", "Profit"), "g"
+        if pct <= -2: return t("손실", "Loss"), "b"
+        return t("본전 근처", "Break-even"), "w"
+
+    pos_rows = []
+    for p in st.session_state.portfolio:
+        sh = p.get("shares", 0) or 0
+        pb = p.get("buy", 0) or 0
+        pc = p.get("cur", 0) or 0
+        pi = p.get("inv", 0) or 0
+        val = sh * pc / 100
+        up = val - pi
+        upct = up / pi * 100 if pi else 0
+        status, kind = pos_status(upct)
+        color = {"g": "#1d7d4f", "b": "#d0312d", "w": "#b25e09"}[kind]
+        pos_rows.append(
+            f'<div class="spec-row"><div class="spec-key">{p.get("name", "")} · {p.get("outcome", "")}</div>'
+            f'<div class="spec-val">{sh:.1f} · {pb:.1f}¢ → {pc:.1f}¢ · {money(val)} · '
+            f'<b style="color:{color}">{signed_money(up)} ({signed_pct(upct)})</b></div>'
+            f'<div><span class="state {kind}">{status}</span></div></div>')
+    if pos_rows:
+        st.markdown(f'<div class="eyebrow">{t("포지션별 손익", "Per-position P&L")}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="spec">' + "".join(pos_rows) + '</div>', unsafe_allow_html=True)
 
     # ---- realized P&L by period with adjustments ----
     st.markdown(f'<div class="eyebrow">{t("실현손익", "Realized P&L")}</div>', unsafe_allow_html=True)
@@ -1397,9 +1479,10 @@ with tab_set:
     st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("새로고침하면 데이터가 사라집니다. 백업을 내려받아 두세요. 프로필도 함께 저장됩니다.", "Data is lost on refresh. Download a backup — your profile is included.")}</div>', unsafe_allow_html=True)
     bc1, bc2 = st.columns(2)
     with bc1:
-        backup = {"profile": st.session_state.profile, "cash": st.session_state.cash,
+   backup = {"profile": st.session_state.profile, "cash": st.session_state.cash,
                   "portfolio": st.session_state.portfolio, "trade_log": st.session_state.trade_log,
-                  "adj_month": st.session_state.adj_month, "adj_year": st.session_state.adj_year}
+                  "adj_month": st.session_state.adj_month, "adj_year": st.session_state.adj_year,
+                  "reviews": st.session_state.reviews}
         st.download_button(t("백업 내려받기 (JSON)", "Download backup (JSON)"),
                            data=json.dumps(backup, ensure_ascii=False, indent=2).encode("utf-8"),
                            file_name="memento_backup.json", mime="application/json", use_container_width=True)
@@ -1414,6 +1497,7 @@ with tab_set:
                 st.session_state.trade_log = data.get("trade_log", [])
                 st.session_state.adj_month = float(data.get("adj_month", 0))
                 st.session_state.adj_year = float(data.get("adj_year", 0))
+                st.session_state.reviews = data.get("reviews", [])
                 st.toast(t("복원했습니다", "Restored"))
                 st.rerun()
             except Exception:
