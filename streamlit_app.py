@@ -211,7 +211,13 @@ def partial_rows(shares, price_dec, investment):
 def call_claude_analysis(team_a, team_b, league, current_price, fair_price, purpose):
     """Claude API로 팀 분석 요청"""
     try:
-        api_key = st.secrets["ANTHROPIC_API_KEY"]
+        try:
+    api_key = st.secrets["ANTHROPIC_API_KEY"]
+except:
+    try:
+        api_key = st.secrets["anthropic"]["api_key"]
+    except:
+        return "❌ API 키를 찾을 수 없습니다. Secrets 설정을 확인해주세요."
     except Exception:
         return "❌ API 키가 설정되지 않았습니다. Streamlit Secrets에 ANTHROPIC_API_KEY를 등록해주세요."
 
