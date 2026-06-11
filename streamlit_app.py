@@ -194,6 +194,10 @@ DEFAULTS = {
     "url_rows": [],
     "ai_text": "", "ai_error": "", "ai_prompt": "", "ai_pair": "",
     "wallet_raw": [],
+    "activity_raw": [],
+    "auto_trades": [],
+    "wallet_addr": "",
+    "imported_tx_ids": [],
     "reviews": [],
 }
 for k, v in DEFAULTS.items():
@@ -713,6 +717,93 @@ def fetch_wallet_positions(addr):
         return json.loads(r.read().decode("utf-8"))
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_wallet_activity(addr, limit=100, offset=0):
+    """Read-only Polymarket activity feed for a wallet. Used for automatic trade history import."""
+    qs = urllib.parse.urlencode({
+        "user": addr,
+        "limit": int(limit),
+        "offset": int(offset),
+        "sortBy": "TIMESTAMP",
+        "sortDirection": "DESC",
+    })
+    api = f"https://data-api.polymarket.com/activity?{qs}"
+    req = urllib.request.Request(api, headers={"User-Agent": "Memento/5.0", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _safe_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _activity_dt(v):
+    ts = _safe_float(v, 0)
+    if ts <= 0:
+        return datetime.now().isoformat()
+    if ts > 10_000_000_000:  # milliseconds
+        ts = ts / 1000
+    # Polymarket timestamps are UTC; display in Korea time for journal grouping.
+    return (datetime.utcfromtimestamp(ts) + timedelta(hours=9)).isoformat()
+
+
+def normalize_activity(raw):
+    """Convert raw Polymarket activity rows into a simple journal-like table."""
+    rows = []
+    if not isinstance(raw, list):
+        return rows
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        typ = str(it.get("type", "TRADE")).upper()
+        side = str(it.get("side", "")).upper()
+        # Keep trade-like rows first. Other activity can stay in raw debug.
+        if typ and typ != "TRADE" and side not in ("BUY", "SELL"):
+            continue
+        price_raw = _safe_float(it.get("price"), 0)
+        price_c = price_raw * 100 if 0 < price_raw <= 1 else price_raw
+        size = _safe_float(it.get("size"), 0)
+        usdc = _safe_float(it.get("usdcSize"), 0)
+        amount = usdc if usdc > 0 else size * (price_c / 100 if price_c else 0)
+        tx_base = it.get("transactionHash") or it.get("transaction_hash") or it.get("hash") or ""
+        asset = it.get("asset") or it.get("conditionId") or it.get("slug") or ""
+        tx_id = "|".join([str(tx_base), str(asset), str(it.get("timestamp", "")), side, str(size), str(price_raw)])
+        rows.append({
+            "tx_id": tx_id,
+            "d": _activity_dt(it.get("timestamp")),
+            "name": it.get("title") or it.get("slug") or it.get("eventSlug") or "Polymarket trade",
+            "outcome": it.get("outcome", ""),
+            "side": side or typ,
+            "price": round(price_c, 2),
+            "shares": round(size, 4),
+            "amount": round(amount, 2),
+            "asset": str(asset),
+        })
+    return rows
+
+
+def merge_activity_into_log(items):
+    """Merge API trades into auto_trades without duplicating existing rows."""
+    if not isinstance(st.session_state.imported_tx_ids, list):
+        st.session_state.imported_tx_ids = []
+    seen = set(st.session_state.imported_tx_ids)
+    added = 0
+    for it in items:
+        tx = it.get("tx_id") or ""
+        if not tx or tx in seen:
+            continue
+        st.session_state.auto_trades.append(it)
+        st.session_state.imported_tx_ids.append(tx)
+        seen.add(tx)
+        added += 1
+    return added
+
+
 MIN_SHARES = 1.0   # 이 미만 수량은 dust로 간주
 MIN_VALUE = 1.0    # 평가금 $1 미만은 숨김
 
@@ -819,6 +910,68 @@ def portfolio_health(portfolio, cash):
             "unrealized": unrealized, "unrealized_pct": unrealized_pct}
 
 
+
+
+def analyze_portfolio_position(p, bankroll):
+    """Analyze one open holding using current portfolio data only."""
+    name = p.get("name", "") or "Polymarket position"
+    outcome = p.get("outcome", "") or ""
+    sh = _safe_float(p.get("shares"), 0)
+    buy = _safe_float(p.get("buy"), 0)
+    cur = _safe_float(p.get("cur"), 0)
+    inv = _safe_float(p.get("inv"), 0)
+    val = sh * cur / 100 if cur else 0
+    pnl = val - inv
+    roi = pnl / inv * 100 if inv else 0
+    pct = val / bankroll * 100 if bankroll else 0
+
+    zone_label, zone_kind, _, zone_note = price_zone(cur)
+    size_label, size_kind, _, size_note = size_rule(pct)
+    g, c1, c2, blk = size_thresholds()
+
+    if pct >= blk:
+        title, kind = t("과대 노출 — 축소 우선", "Oversized — reduce first"), "b"
+        summary = t("이 포지션은 내 진입 금지선보다 큽니다. 추가매수보다 일부 축소가 우선입니다.",
+                    "This holding is above your no-entry line. Reducing comes before adding.")
+    elif roi >= 30 and cur >= 80:
+        title, kind = t("수익 구간 — 부분매도 검토", "Profit zone — consider partial sell"), "w"
+        summary = t("수익률이 크고 가격도 높은 편입니다. 원금 회수 또는 일부 익절을 검토할 만합니다.",
+                    "Profit is strong and price is high. Consider recovering principal or taking partial profit.")
+    elif roi <= -35:
+        title, kind = t("손실 확대 — 추가매수 금지", "Large loss — no adding"), "b"
+        summary = t("손실률이 큽니다. 복구 배팅보다 손절·홀딩 기준을 다시 확인하세요.",
+                    "Loss is large. Re-check stop/hold rules instead of chasing.")
+    elif cur >= 90:
+        title, kind = t("고가 구간 — 신규매수 비추천", "High price — new buys discouraged"), "w"
+        summary = t("현재가는 고가 구간입니다. 홀딩은 가능해도 추가 진입은 보수적으로 봐야 합니다.",
+                    "Price is high. Holding may be fine, but adding should be conservative.")
+    elif cur <= 5:
+        title, kind = t("복권형 구간 — 소액 원칙", "Lottery zone — small only"), "w"
+        summary = t("초저가 포지션입니다. 추가매수보다 최대 손실을 제한하는 게 중요합니다.",
+                    "Very low-price holding. Limit max loss rather than adding.")
+    elif pct >= c1:
+        title, kind = t("크기 주의 — 비중 점검", "Size caution — review exposure"), "w"
+        summary = t("가격 자체보다 포지션 크기가 커지고 있습니다. 다음 진입 전에 전체 노출을 확인하세요.",
+                    "Size is becoming the issue. Check total exposure before the next entry.")
+    else:
+        title, kind = t("관리 가능", "Manageable"), "g"
+        summary = t("현재 데이터 기준으로는 과도한 위험 신호가 크지 않습니다.",
+                    "Based on current data, no major risk signal stands out.")
+
+    lines_ = [
+        ("g" if pnl >= 0 else "b", t(f"현재 손익: {signed_money(pnl)} ({signed_pct(roi)}) · 평가금 {money(val)}",
+                                      f"Current P&L: {signed_money(pnl)} ({signed_pct(roi)}) · value {money(val)}")),
+        (size_kind, t(f"포지션 크기: 총자산의 {pct:.1f}% · {size_label}",
+                      f"Position size: {pct:.1f}% of assets · {size_label}")),
+        (zone_kind, t(f"가격 구간: {cur:.1f}¢ · {zone_label}. {zone_note}",
+                      f"Price zone: {cur:.1f}¢ · {zone_label}. {zone_note}")),
+        ("i", t(f"평균 매수가 {buy:.1f}¢ · 보유 수량 {sh:.2f} · 선택 {outcome}",
+                 f"Avg buy {buy:.1f}¢ · shares {sh:.2f} · side {outcome}")),
+    ]
+    return {"name": name, "outcome": outcome, "title": title, "kind": kind, "summary": summary,
+            "value": val, "pnl": pnl, "roi": roi, "pct": pct, "lines": lines_}
+
+
 # =====================================================
 # Onboarding gate
 # =====================================================
@@ -915,12 +1068,12 @@ st.markdown(
     f'{t("감정 한도", "cap")} {money(prof["emotional_limit"])}</div>',
     unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4, tab_pf, tab_set = st.tabs([
+tab1, tab_pf, tab2, tab3, tab4, tab_set = st.tabs([
     t("진입 판독", "Entry check"),
+    t("포트폴리오", "Portfolio"),
     t("포지션 관리", "Positions"),
     t("부분매도", "Partial sell"),
     t("거래일지", "Journal"),
-    t("포트폴리오", "Portfolio"),
     t("설정 · 도구", "Settings · tools"),
 ])
 
@@ -1253,7 +1406,54 @@ with tab3:
 # =====================================================
 with tab4:
     st.markdown(f'<div class="headline">{t("거래일지", "Journal")}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="subline">{t("기록한 거래는 포트폴리오의 주·월·연 실현손익에 자동 반영됩니다.", "Trades feed the weekly / monthly / yearly P&L in Portfolio.")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="subline">{t("직접 기록은 실현손익 계산에 쓰고, API 불러오기는 배팅내역 확인용으로 분리해서 관리합니다.", "Manual entries feed realized P&L; API imports are kept separately for trade-history review.")}</div>', unsafe_allow_html=True)
+
+    with st.expander(t("Polymarket 배팅내역 자동 불러오기", "Import Polymarket trade history"), expanded=False):
+        st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("지갑 주소 기준으로 최근 체결내역을 불러옵니다. 매수/매도 짝짓기는 복잡하므로, 우선 자동 거래내역은 직접 거래일지와 분리해서 보여줍니다.", "Import recent wallet activity. Because pairing buys and sells is complex, auto trades are shown separately from manual journal entries first.")}</div>', unsafe_allow_html=True)
+        ac1, ac2 = st.columns([3, 1])
+        with ac1:
+            st.session_state.wallet_addr = st.text_input(t("지갑 주소", "Wallet address"), value=st.session_state.wallet_addr, placeholder="0x...", key="activity_wallet_addr")
+        with ac2:
+            act_limit = st.number_input(t("불러올 개수", "Limit"), 10, 300, 100, step=10)
+        if st.button(t("거래내역 불러오기", "Import trades"), use_container_width=True):
+            a = st.session_state.wallet_addr.strip()
+            if not (a.startswith("0x") and len(a) == 42):
+                st.markdown(line(t("주소 형식 오류 — 0x로 시작하는 42자 주소인지 확인하세요.", "Bad address — must be 42 chars starting with 0x."), "b"), unsafe_allow_html=True)
+            else:
+                try:
+                    with st.spinner(t("거래내역 불러오는 중", "Fetching activity")):
+                        raw = fetch_wallet_activity(a, limit=act_limit)
+                    st.session_state.activity_raw = raw
+                    items = normalize_activity(raw)
+                    added = merge_activity_into_log(items)
+                    st.markdown(line(t(f"자동 거래내역 {len(items)}건 확인 · 새로 추가 {added}건", f"Found {len(items)} auto trades · added {added}"), "g"), unsafe_allow_html=True)
+                except urllib.error.HTTPError as e:
+                    st.markdown(line(t(f"거래내역 불러오기 실패 (HTTP {e.code})", f"Activity import failed (HTTP {e.code})"), "b"), unsafe_allow_html=True)
+                except Exception as e:
+                    st.markdown(line(t(f"거래내역 불러오기 실패 — {e}", f"Activity import failed — {e}"), "b"), unsafe_allow_html=True)
+
+        if st.session_state.auto_trades:
+            auto_view = pd.DataFrame([{
+                t("날짜", "Date"): tr["d"][:10],
+                t("시장", "Market"): tr["name"],
+                t("선택", "Outcome"): tr["outcome"],
+                t("매수/매도", "Side"): tr["side"],
+                t("가격", "Price"): cents(tr["price"]),
+                t("수량", "Shares"): tr["shares"],
+                t("금액", "Amount"): money(tr["amount"]),
+            } for tr in st.session_state.auto_trades])
+            st.dataframe(auto_view, use_container_width=True, hide_index=True)
+            csv_auto = auto_view.to_csv(index=False).encode("utf-8-sig")
+            ca, cb = st.columns(2)
+            with ca:
+                st.download_button(t("자동 거래내역 CSV", "Download auto trades CSV"), data=csv_auto, file_name="memento_auto_trades.csv", mime="text/csv", use_container_width=True)
+            with cb:
+                if st.button(t("자동 거래내역 비우기", "Clear auto trades"), use_container_width=True):
+                    st.session_state.auto_trades = []
+                    st.session_state.imported_tx_ids = []
+                    st.rerun()
+        with st.expander(t("디버그 — activity raw 응답", "Debug — raw activity response")):
+            st.json(st.session_state.activity_raw)
 
     with st.form("trade_form"):
         t1c, t2c, t3c = st.columns(3)
@@ -1343,14 +1543,14 @@ with tab4:
 # =====================================================
 with tab_pf:
     st.markdown(f'<div class="headline">{t("포트폴리오", "Portfolio")}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="subline">{t("보유 포지션·현금·성과를 한눈에. 시작 자금 대비 얼마나 성장했는지도 보여드립니다.", "Positions, cash and performance — including growth vs your starting capital.")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="subline">{t("먼저 현재 보유 포지션을 판단하고, 그 다음 전체 자산과 성과를 확인합니다.", "Review open holdings first, then check overall assets and performance.")}</div>', unsafe_allow_html=True)
 
-    # wallet import
+    # ---- import / debug tools ----
     with st.expander(t("폴리마켓 지갑으로 포지션 불러오기", "Import positions from a Polymarket wallet")):
-        st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("폴리마켓 프로필 주소(0x로 시작)를 붙여넣으면 공개 데이터 API로 보유 포지션을 읽어옵니다. 로그인·서명 없이 조회만 합니다.", "Paste your Polymarket profile address (starts with 0x). We read your open positions via the public data API — read-only, no login or signing.")}</div>', unsafe_allow_html=True)
-        addr = st.text_input(t("지갑 주소", "Wallet address"), "", placeholder="0x...")
-        if st.button(t("불러오기", "Import"), use_container_width=True):
-            a = addr.strip()
+        st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("폴리마켓 프로필 주소(0x로 시작)를 붙여넣으면 공개 데이터 API로 현재 보유 포지션을 읽어옵니다. 로그인·서명 없이 조회만 합니다.", "Paste your Polymarket wallet address. We read open positions via the public data API — read-only, no login or signing.")}</div>', unsafe_allow_html=True)
+        st.session_state.wallet_addr = st.text_input(t("지갑 주소", "Wallet address"), value=st.session_state.wallet_addr, placeholder="0x...", key="portfolio_wallet_addr")
+        if st.button(t("보유 포지션 불러오기", "Import open positions"), use_container_width=True):
+            a = st.session_state.wallet_addr.strip()
             if not (a.startswith("0x") and len(a) == 42):
                 st.markdown(line(t("주소 형식 오류 — 0x로 시작하는 42자 주소인지 확인하세요.", "Bad address — must be 42 chars starting with 0x."), "b"), unsafe_allow_html=True)
             else:
@@ -1362,12 +1562,12 @@ with tab_pf:
                     st.session_state.portfolio = [dict(
                         name=it.get("title") or "Polymarket position",
                         outcome=it.get("outcome", ""),
-                        buy=round(float(it.get("avgPrice", 0)) * 100, 1),
-                        shares=round(float(it.get("size", 0)), 2),
-                        inv=round(float(it.get("initialValue", 0)), 2),
-                        cur=round(float(it.get("curPrice", 0)) * 100, 1),
+                        buy=round(_safe_float(it.get("avgPrice"), 0) * 100, 1),
+                        shares=round(_safe_float(it.get("size"), 0), 2),
+                        inv=round(_safe_float(it.get("initialValue"), 0), 2),
+                        cur=round(_safe_float(it.get("curPrice"), 0) * 100, 1),
                     ) for it in open_items]
-                    st.toast(t(f"보유 포지션 {len(open_items)}개", f"{len(open_items)} open positions"))
+                    st.toast(t(f"현재 보유 포지션 {len(open_items)}개", f"{len(open_items)} open positions"))
                     st.rerun()
                 except urllib.error.HTTPError as e:
                     st.markdown(line(t(f"연결 실패 (HTTP {e.code}) — 주소 확인 필요", f"Failed (HTTP {e.code}) — check address"), "b"), unsafe_allow_html=True)
@@ -1376,27 +1576,24 @@ with tab_pf:
                 except Exception as e:
                     st.markdown(line(t(f"불러오기 실패 — {e}", f"Import failed — {e}"), "b"), unsafe_allow_html=True)
 
-    with st.expander(t("디버그 — raw API 응답 보기", "Debug — raw API response")):
+    with st.expander(t("디버그 — positions raw 응답", "Debug — raw positions response")):
         st.json(st.session_state.wallet_raw)
 
+    # ---- open positions first ----
     cash = st.number_input(t("현금 잔고 (USDC, $)", "Cash balance (USDC, $)"), 0.0, value=float(st.session_state.cash), key="cash_input")
     st.session_state.cash = cash
+    pos_value = sum((p.get("shares", 0) or 0) * ((p.get("cur", 0) or 0) / 100) for p in st.session_state.portfolio)
+    pos_cost = sum((p.get("inv", 0) or 0) for p in st.session_state.portfolio)
+    total_assets = cash + pos_value
+    bankroll_for_positions = total_assets if total_assets > 0 else prof["assets"]
 
-    with st.expander(t("입출금 보정", "Deposit / withdrawal adjustment")):
-        st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("출금하면 지갑 자산은 줄어도 실제 번 돈은 사라진 게 아닙니다. 시작 자금 이후 추가 입금/출금을 넣으면 보정 후 실제 성과를 계산합니다.", "Withdrawals lower wallet assets, but not real profit. Enter deposits/withdrawals after the starting capital to calculate adjusted performance.")}</div>', unsafe_allow_html=True)
-        cf1, cf2 = st.columns(2)
-        with cf1:
-            st.session_state.deposits = st.number_input(t("시작 이후 추가 입금 총액 ($)", "Extra deposits after start ($)"), 0.0, value=float(st.session_state.deposits))
-        with cf2:
-            st.session_state.withdrawals = st.number_input(t("시작 이후 출금 총액 ($)", "Withdrawals after start ($)"), 0.0, value=float(st.session_state.withdrawals))
-
-    st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("보유 포지션", "Open positions")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("현재 보유 포지션", "Open positions")}</div>', unsafe_allow_html=True)
     if st.session_state.portfolio:
         df = pd.DataFrame(st.session_state.portfolio)
         col_cfg = {
-            "name": st.column_config.TextColumn(t("거래", "Trade")),
+            "name": st.column_config.TextColumn(t("시장", "Market")),
             "outcome": st.column_config.TextColumn(t("선택", "Side")),
-            "buy": st.column_config.NumberColumn(t("매수가 (¢)", "Buy (¢)"), format="%.1f"),
+            "buy": st.column_config.NumberColumn(t("평균 매수가 (¢)", "Avg buy (¢)"), format="%.1f"),
             "shares": st.column_config.NumberColumn(t("수량", "Shares"), format="%.2f"),
             "inv": st.column_config.NumberColumn(t("투자금 ($)", "Cost ($)"), format="%.2f"),
             "cur": st.column_config.NumberColumn(t("현재가 (¢)", "Now (¢)"), format="%.1f"),
@@ -1404,19 +1601,19 @@ with tab_pf:
         edited = st.data_editor(df, column_config=col_cfg, use_container_width=True,
                                 hide_index=True, num_rows="dynamic", key="pf_editor")
         st.session_state.portfolio = edited.to_dict("records")
-        st.markdown(f'<div class="footnote">{t("현재가 칸을 수정하면 손익이 다시 계산됩니다.", "Edit the Now (¢) column to recalculate.")}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="footnote">{t("현재가·수량·투자금을 수정하면 아래 포지션별 판단과 자산 요약이 다시 계산됩니다.", "Edit price, shares or cost to recalculate the position verdicts and asset summary below.")}</div>', unsafe_allow_html=True)
     else:
         st.markdown(
             f"""<div class="quiet" style="padding:36px 20px;">
 <div class="q-title">{t("등록된 포지션이 없습니다", "No positions yet")}</div>
-<div class="q-body">{t("아래에서 직접 추가하거나, 위에서 지갑으로 불러오세요.", "Add manually below, or import via wallet above.")}</div>
+<div class="q-body">{t("위에서 지갑으로 불러오거나, 아래에서 직접 추가하세요.", "Import via wallet above, or add one manually below.")}</div>
 </div>""", unsafe_allow_html=True)
 
     with st.form("add_pos"):
         a1, a2, a3 = st.columns(3)
         with a1:
-            np_name = st.text_input(t("거래 이름", "Trade name"), "")
-            np_out = st.text_input(t("선택한 팀·결과", "Side"), "")
+            np_name = st.text_input(t("시장 이름", "Market name"), "")
+            np_out = st.text_input(t("선택한 결과", "Outcome"), "")
         with a2:
             np_buy = st.number_input(t("평균 매수가 (¢)", "Avg buy (¢)"), 0.1, 99.9, 50.0)
             np_cur = st.number_input(t("현재가 (¢)", "Now (¢)"), 0.1, 100.0, 50.0)
@@ -1427,7 +1624,7 @@ with tab_pf:
 
     if add_pos:
         if not np_name.strip():
-            st.markdown(line(t("거래 이름을 입력해주세요.", "Please enter a name."), "w"), unsafe_allow_html=True)
+            st.markdown(line(t("시장 이름을 입력해주세요.", "Please enter a market name."), "w"), unsafe_allow_html=True)
         else:
             shares_v = np_shares if np_shares > 0 else (np_inv / (np_buy / 100) if np_buy > 0 else 0)
             inv_v = np_inv if np_inv > 0 else shares_v * (np_buy / 100)
@@ -1435,16 +1632,36 @@ with tab_pf:
                                                    shares=round(shares_v, 2), inv=round(inv_v, 2), cur=np_cur))
             st.rerun()
 
-    # ---- assets ----
+    # ---- per-position analysis before asset analysis ----
+    st.markdown(f'<div class="eyebrow" style="margin-top:24px;">{t("포지션별 자동 분석", "Per-position analysis")}</div>', unsafe_allow_html=True)
+    if st.session_state.portfolio:
+        for p in st.session_state.portfolio:
+            ar = analyze_portfolio_position(p, bankroll_for_positions)
+            st.markdown(
+                f'<div class="spec" style="margin-bottom:14px;">'
+                f'<div class="spec-row"><div class="spec-key">{ar["name"]}<br><span style="color:var(--gray2);font-size:12px;">{ar["outcome"]}</span></div>'
+                f'<div class="spec-val"><b>{ar["title"]}</b><br>{ar["summary"]}</div>'
+                f'<div><span class="state {ar["kind"]}">{grade_word(ar["kind"])}</span></div></div>'
+                + "".join(spec_row("", txt, "", kk) for kk, txt in ar["lines"])
+                + '</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="footnote">{t("보유 포지션을 불러오면 각 배팅별 판단이 여기에 먼저 표시됩니다.", "Import holdings to see a verdict for each bet here first.")}</div>', unsafe_allow_html=True)
+
+    # ---- total assets after position analysis ----
+    with st.expander(t("입출금 보정", "Deposit / withdrawal adjustment")):
+        st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("출금하면 지갑 자산은 줄어도 실제 번 돈은 사라진 게 아닙니다. 시작 자금 이후 추가 입금/출금을 넣으면 보정 후 실제 성과를 계산합니다.", "Withdrawals lower wallet assets, but not real profit. Enter deposits/withdrawals after the starting capital to calculate adjusted performance.")}</div>', unsafe_allow_html=True)
+        cf1, cf2 = st.columns(2)
+        with cf1:
+            st.session_state.deposits = st.number_input(t("시작 이후 추가 입금 총액 ($)", "Extra deposits after start ($)"), 0.0, value=float(st.session_state.deposits))
+        with cf2:
+            st.session_state.withdrawals = st.number_input(t("시작 이후 출금 총액 ($)", "Withdrawals after start ($)"), 0.0, value=float(st.session_state.withdrawals))
+
     pos_value = sum((p.get("shares", 0) or 0) * ((p.get("cur", 0) or 0) / 100) for p in st.session_state.portfolio)
     pos_cost = sum((p.get("inv", 0) or 0) for p in st.session_state.portfolio)
     unrealized = pos_value - pos_cost
     total_assets = cash + pos_value
     sc = prof["start_capital"]
     growth = (total_assets - sc) / sc * 100 if sc else 0
-    g_tone = "pos" if growth >= 0 else "neg"
-    u_tone = "pos" if unrealized >= 0 else "neg"
-
     realized_total = sum(tr["profit"] for tr in st.session_state.trade_log) + st.session_state.adj_year
     total_pnl = unrealized + realized_total
     total_roi = total_pnl / sc * 100 if sc else 0
@@ -1454,71 +1671,38 @@ with tab_pf:
     flow_adjusted_roi = flow_adjusted_pnl / sc * 100 if sc else 0
     wallet_gap = flow_adjusted_pnl - (total_assets - sc)
 
-    st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("자산 현황", "Assets")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("자산 요약", "Asset summary")}</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="stats">'
         + stat(t("현재 총자산", "Total assets"), money(total_assets), t("현금 + 평가금", "Cash + value"))
-        + stat(t("총 투자금", "Total invested"), money(pos_cost), "")
-        + stat(t("현재 평가금액", "Current value"), money(pos_value), "")
-        + stat(t("보유 포지션", "Open positions"), f"{len(st.session_state.portfolio)}", "")
+        + stat(t("현금", "Cash"), money(cash), t("직접 입력", "Manual input"))
+        + stat(t("포지션 평가금", "Position value"), money(pos_value), t(f"{len(st.session_state.portfolio)}개 보유", f"{len(st.session_state.portfolio)} holdings"))
+        + stat(t("미실현손익", "Unrealized"), signed_money(unrealized), signed_pct(unrealized / pos_cost * 100 if pos_cost else 0), "pos" if unrealized >= 0 else "neg")
         + "</div>"
         + '<div class="stats">'
-        + stat(t("실현손익", "Realized"), signed_money(realized_total), "", "pos" if realized_total >= 0 else "neg")
-        + stat(t("미실현손익", "Unrealized"), signed_money(unrealized), "", "pos" if unrealized >= 0 else "neg")
-        + stat(t("총 손익", "Total P&L"), signed_money(total_pnl), "", "pos" if total_pnl >= 0 else "neg")
-        + stat(t("총 수익률", "Total ROI"), signed_pct(total_roi), t(f"시작 {money(sc)}", f"Start {money(sc)}"), "pos" if total_roi >= 0 else "neg")
-        + "</div>"
-        + '<div class="stats three">'
-        + stat(t("입출금 보정 실제손익", "Flow-adjusted P&L"), signed_money(flow_adjusted_pnl), t(f"출금 {money(withdrawals)} · 추가입금 {money(deposits)}", f"Withdrawn {money(withdrawals)} · Deposited {money(deposits)}"), "pos" if flow_adjusted_pnl >= 0 else "neg")
+        + stat(t("앱 기록 실현손익", "App-recorded realized"), signed_money(realized_total), t("거래일지 + 올해 보정", "Journal + yearly adjustment"), "pos" if realized_total >= 0 else "neg")
+        + stat(t("총 손익", "Total P&L"), signed_money(total_pnl), signed_pct(total_roi), "pos" if total_pnl >= 0 else "neg")
+        + stat(t("입출금 보정 실제손익", "Flow-adjusted P&L"), signed_money(flow_adjusted_pnl), t(f"출금 {money(withdrawals)} · 추가입금 {money(deposits)}", f"Withdrawn {money(withdrawals)} · deposited {money(deposits)}"), "pos" if flow_adjusted_pnl >= 0 else "neg")
         + stat(t("보정 후 수익률", "Adjusted ROI"), signed_pct(flow_adjusted_roi), t(f"시작 {money(sc)} 기준", f"vs start {money(sc)}"), "pos" if flow_adjusted_roi >= 0 else "neg")
-        + stat(t("지갑-성과 차이", "Wallet-performance gap"), signed_money(wallet_gap), t("출금/추가입금 때문에 생긴 차이", "Difference caused by withdrawals/deposits"), "pos" if wallet_gap >= 0 else "neg")
         + "</div>", unsafe_allow_html=True)
 
-    def pos_status(pct):
-        if pct >= 2: return t("이익", "Profit"), "g"
-        if pct <= -2: return t("손실", "Loss"), "b"
-        return t("본전 근처", "Break-even"), "w"
-
-    pos_rows = []
-    for p in st.session_state.portfolio:
-        sh = p.get("shares", 0) or 0
-        pb = p.get("buy", 0) or 0
-        pc = p.get("cur", 0) or 0
-        pi = p.get("inv", 0) or 0
-        val = sh * pc / 100
-        up = val - pi
-        upct = up / pi * 100 if pi else 0
-        status, kind = pos_status(upct)
-        color = {"g": "#1d7d4f", "b": "#d0312d", "w": "#b25e09"}[kind]
-        pos_rows.append(
-            f'<div class="spec-row"><div class="spec-key">{p.get("name", "")} · {p.get("outcome", "")}</div>'
-            f'<div class="spec-val">{sh:.1f} · {pb:.1f}¢ → {pc:.1f}¢ · {money(val)} · '
-            f'<b style="color:{color}">{signed_money(up)} ({signed_pct(upct)})</b></div>'
-            f'<div><span class="state {kind}">{status}</span></div></div>')
-    if pos_rows:
-        st.markdown(f'<div class="eyebrow">{t("포지션별 손익", "Per-position P&L")}</div>', unsafe_allow_html=True)
-        st.markdown('<div class="spec">' + "".join(pos_rows) + '</div>', unsafe_allow_html=True)
-
-    # ---- automatic portfolio analysis ----
     ph = portfolio_health(st.session_state.portfolio, cash)
-    st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("보유 포지션 자동 분석", "Automatic holdings analysis")}</div>', unsafe_allow_html=True)
-    ph_html = (
+    st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("전체 포트폴리오 판단", "Overall portfolio verdict")}</div>', unsafe_allow_html=True)
+    st.markdown(
         f'<div class="verdict" style="padding-top:14px;">'
         f'<div class="v-title" style="font-size:30px;"><span class="dot {ph["kind"]}"></span>{ph["title"]}</div>'
-        f'<div class="v-sub">{ph["summary"]}</div></div>'
-    )
-    st.markdown(ph_html, unsafe_allow_html=True)
+        f'<div class="v-sub">{ph["summary"]}</div></div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="stats three">'
         + stat(t("전체 포지션 노출", "Total exposure"), f"{ph['exposure_pct']:.1f}%", t("평가금 / 총자산", "Value / assets"), "neg" if ph['exposure_pct'] >= blk_ else "")
         + stat(t("현금 비중", "Cash ratio"), f"{ph['cash_pct']:.1f}%", t("현금 / 총자산", "Cash / assets"))
-        + stat(t("미실현손익", "Unrealized"), signed_money(ph['unrealized']), signed_pct(ph['unrealized_pct']), "pos" if ph['unrealized'] >= 0 else "neg")
+        + stat(t("지갑-성과 차이", "Wallet-performance gap"), signed_money(wallet_gap), t("출금/추가입금 영향", "Deposits/withdrawals effect"), "pos" if wallet_gap >= 0 else "neg")
         + "</div>", unsafe_allow_html=True)
     if ph["lines"]:
         st.markdown("".join(line(txt, kk) for kk, txt in ph["lines"]), unsafe_allow_html=True)
 
     # ---- realized P&L by period with adjustments ----
-    st.markdown(f'<div class="eyebrow">{t("실현손익", "Realized P&L")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="eyebrow">{t("기간별 실현손익", "Realized P&L by period")}</div>', unsafe_allow_html=True)
     with st.expander(t("앱 사용 전 손익 보정 (이미 번 돈 반영)", "Pre-app P&L adjustment (count earlier gains)")):
         st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("앱을 쓰기 전에 이미 번(잃은) 금액을 더해 이번 달·올해 손익에 반영합니다.", "Add gains/losses made before using this app, so monthly/yearly totals are accurate.")}</div>', unsafe_allow_html=True)
         j1, j2 = st.columns(2)
@@ -1536,7 +1720,7 @@ with tab_pf:
         + stat(t("이번 달", "This month"), signed_money(m), pct_of_start(m), "pos" if m >= 0 else "neg")
         + stat(t("올해", "This year"), signed_money(y), pct_of_start(y), "pos" if y >= 0 else "neg")
         + "</div>", unsafe_allow_html=True)
-    st.markdown(f'<div class="footnote">{t("퍼센트는 시작 자금 기준입니다. 거래일지 기록 + 위 보정값으로 계산됩니다.", "Percentages are vs starting capital. Computed from journal entries + adjustments above.")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="footnote">{t("퍼센트는 시작 자금 기준입니다. 자동 거래내역은 아직 손익 집계에 합산하지 않고, 직접 거래일지와 보정값만 합산합니다.", "Percentages are vs starting capital. Auto-imported activity is not yet paired into realized P&L; only manual journal entries and adjustments are counted.")}</div>', unsafe_allow_html=True)
 
 
 # =====================================================
@@ -1619,6 +1803,8 @@ with tab_set:
         backup = {"profile": st.session_state.profile, "cash": st.session_state.cash,
                   "deposits": st.session_state.deposits, "withdrawals": st.session_state.withdrawals,
                   "portfolio": st.session_state.portfolio, "trade_log": st.session_state.trade_log,
+                  "auto_trades": st.session_state.auto_trades, "wallet_addr": st.session_state.wallet_addr,
+                  "imported_tx_ids": st.session_state.imported_tx_ids,
                   "adj_month": st.session_state.adj_month, "adj_year": st.session_state.adj_year,
                   "reviews": st.session_state.reviews}
         st.download_button(t("백업 내려받기 (JSON)", "Download backup (JSON)"),
@@ -1635,6 +1821,9 @@ with tab_set:
                 st.session_state.withdrawals = float(data.get("withdrawals", 0))
                 st.session_state.portfolio = data.get("portfolio", [])
                 st.session_state.trade_log = data.get("trade_log", [])
+                st.session_state.auto_trades = data.get("auto_trades", [])
+                st.session_state.wallet_addr = data.get("wallet_addr", "")
+                st.session_state.imported_tx_ids = data.get("imported_tx_ids", [])
                 st.session_state.adj_month = float(data.get("adj_month", 0))
                 st.session_state.adj_year = float(data.get("adj_year", 0))
                 st.session_state.reviews = data.get("reviews", [])
