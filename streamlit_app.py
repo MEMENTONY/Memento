@@ -1,4 +1,5 @@
 import json
+import html
 import os
 import urllib.error
 import urllib.parse
@@ -158,6 +159,32 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 26px 0; }
 .quiet .q-title { font-size: 16px; font-weight: 600; }
 .quiet .q-body { margin-top: 8px; font-size: 13.5px; color: var(--gray); line-height: 1.65; }
 
+
+/* portfolio cards and activity dashboard */
+.pf-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 10px 0 22px 0; }
+.pf-card { border: 1px solid var(--hairline); border-radius: 18px; padding: 18px; background: #ffffff; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+.pf-card-head { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; margin-bottom: 14px; }
+.pf-title { font-size: 15px; font-weight: 650; letter-spacing: -.012em; line-height: 1.35; color: var(--ink); }
+.pf-sub { margin-top: 5px; font-size: 12.5px; color: var(--gray); line-height: 1.45; }
+.pf-big { font-size: 28px; font-weight: 650; letter-spacing: -.03em; font-variant-numeric: tabular-nums; margin: 4px 0 2px 0; }
+.pf-big.pos { color: var(--green); } .pf-big.neg { color: var(--red); }
+.pf-metrics { display:grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0; }
+.pf-metric { border-top: 1px solid var(--hairline); padding-top: 10px; min-width: 0; }
+.pf-metric .k { font-size: 11.5px; color: var(--gray); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pf-metric .v { margin-top: 4px; font-size: 14px; font-weight: 600; color: var(--ink2); font-variant-numeric: tabular-nums; }
+.pf-note { font-size: 13px; line-height: 1.55; color: var(--ink2); padding-top: 12px; border-top: 1px solid var(--hairline); }
+.trade-grid { display:grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 10px 0 18px 0; }
+.trade-card { border: 1px solid var(--hairline); border-radius: 16px; padding: 16px; background:#fff; }
+.trade-card .k { font-size: 12px; color: var(--gray); }
+.trade-card .v { margin-top: 6px; font-size: 24px; font-weight: 650; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+.trade-insight { border-top: 1px solid var(--hairline); padding: 13px 0; font-size: 14px; line-height: 1.6; color: var(--ink2); }
+.trade-insight:first-child { border-top: none; }
+@media (max-width: 880px) {
+  .pf-grid { grid-template-columns: 1fr; }
+  .pf-metrics { grid-template-columns: repeat(2, 1fr); }
+  .trade-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
 .ai-block { border-top: 1px solid var(--hairline); padding: 15px 0; }
 .ai-block .a-key { font-size: 12px; font-weight: 600; color: var(--gray); letter-spacing: .05em; text-transform: uppercase; }
 .ai-block .a-body { margin-top: 7px; font-size: 14.5px; color: var(--ink2); line-height: 1.7; }
@@ -264,6 +291,9 @@ def verdict_dot(level):
 
 def grade_word(kind):
     return {"g": t("좋음", "Good"), "w": t("주의", "Caution"), "b": t("위험", "Risk"), "i": t("보통", "Neutral")}[kind]
+
+def esc(v):
+    return html.escape(str(v or ""), quote=True)
 
 
 # =====================================================
@@ -804,6 +834,121 @@ def merge_activity_into_log(items):
     return added
 
 
+def summarize_activity(items):
+    # Summarize imported activity for pattern review. Does not calculate realized P&L.
+    now = datetime.now()
+    today = now.date().isoformat()
+    week_start = (now - timedelta(days=now.weekday())).date()
+    month_key = now.strftime("%Y-%m")
+    out = {
+        "count": 0, "buy_count": 0, "sell_count": 0, "today_count": 0,
+        "week_count": 0, "month_count": 0, "total_amount": 0.0,
+        "top_market": "-", "top_market_count": 0, "market_count": 0,
+        "repeat_markets": [], "heavy_markets": [], "insights": []
+    }
+    if not items:
+        out["insights"].append(("i", t("불러온 거래내역이 없습니다.", "No imported activity yet.")))
+        return out
+
+    market_stats = {}
+    for tr in items:
+        name = str(tr.get("name") or "Unknown")
+        side = str(tr.get("side") or "").upper()
+        amount = _safe_float(tr.get("amount"), 0)
+        out["count"] += 1
+        out["total_amount"] += amount
+        if side == "BUY":
+            out["buy_count"] += 1
+        elif side == "SELL":
+            out["sell_count"] += 1
+        d = str(tr.get("d") or "")[:10]
+        if d == today:
+            out["today_count"] += 1
+        try:
+            dd = datetime.fromisoformat(str(tr.get("d"))).date()
+            if dd >= week_start:
+                out["week_count"] += 1
+            if str(tr.get("d"))[:7] == month_key:
+                out["month_count"] += 1
+        except Exception:
+            pass
+        stt = market_stats.setdefault(name, {"count": 0, "buy": 0, "sell": 0, "amount": 0.0})
+        stt["count"] += 1
+        stt["amount"] += amount
+        if side == "BUY": stt["buy"] += 1
+        if side == "SELL": stt["sell"] += 1
+
+    out["market_count"] = len(market_stats)
+    ranked = sorted(market_stats.items(), key=lambda x: (x[1]["count"], x[1]["amount"]), reverse=True)
+    if ranked:
+        out["top_market"], top = ranked[0]
+        out["top_market_count"] = top["count"]
+    out["repeat_markets"] = [(n, v) for n, v in ranked if v["count"] >= 3]
+    out["heavy_markets"] = [(n, v) for n, v in ranked if v["amount"] >= max(out["total_amount"] * 0.35, 50)]
+
+    buy_ratio = out["buy_count"] / out["count"] * 100 if out["count"] else 0
+    if out["today_count"] >= 10:
+        out["insights"].append(("b", t(f"오늘 거래 {out['today_count']}건 — 거래 빈도가 높습니다. 감정적 재진입 여부를 점검하세요.",
+                                        f"{out['today_count']} trades today — high frequency. Check for emotional re-entry.")))
+    elif out["today_count"] >= 5:
+        out["insights"].append(("w", t(f"오늘 거래 {out['today_count']}건 — 잦은 진입 구간입니다.",
+                                        f"{out['today_count']} trades today — frequent trading zone.")))
+    else:
+        out["insights"].append(("g", t(f"오늘 거래 {out['today_count']}건 — 빈도는 과하지 않습니다.",
+                                        f"{out['today_count']} trades today — frequency is not excessive.")))
+    if buy_ratio >= 75 and out["count"] >= 5:
+        out["insights"].append(("w", t(f"BUY 비율 {buy_ratio:.0f}% — 매수 중심입니다. 익절/축소 계획이 있는지 확인하세요.",
+                                        f"BUY ratio {buy_ratio:.0f}% — buy-heavy. Check whether you have exit/reduction rules.")))
+    if out["repeat_markets"]:
+        names = ", ".join(n[:34] + ("…" if len(n) > 34 else "") for n, _ in out["repeat_markets"][:3])
+        out["insights"].append(("w", t(f"같은 시장 반복 거래 감지: {names}. 물타기/추격매수인지 복기하세요.",
+                                        f"Repeated market activity: {names}. Review whether it was averaging down or chasing.")))
+    if out["heavy_markets"]:
+        n, v = out["heavy_markets"][0]
+        out["insights"].append(("w", t(f"거래금액 집중: {n[:48]} · {money(v['amount'])}. 한 시장에 노출이 몰렸는지 확인하세요.",
+                                        f"Concentrated turnover: {n[:48]} · {money(v['amount'])}. Check if exposure is clustered.")))
+    return out
+
+
+def activity_market_table(items):
+    # Market-level activity summary table, intentionally no realized P&L pairing.
+    agg = {}
+    for tr in items:
+        name = str(tr.get("name") or "Unknown")
+        side = str(tr.get("side") or "").upper()
+        a = agg.setdefault(name, {"market": name, "count": 0, "buy": 0, "sell": 0, "amount": 0.0, "last": ""})
+        a["count"] += 1
+        a["amount"] += _safe_float(tr.get("amount"), 0)
+        if side == "BUY": a["buy"] += 1
+        if side == "SELL": a["sell"] += 1
+        d = str(tr.get("d") or "")[:16]
+        if d > a["last"]:
+            a["last"] = d
+    return sorted(agg.values(), key=lambda x: (x["count"], x["amount"]), reverse=True)
+
+
+def portfolio_card_html(ar):
+    pnl_cls = "pos" if ar.get("pnl", 0) >= 0 else "neg"
+    return f'''<div class="pf-card">
+  <div class="pf-card-head">
+    <div>
+      <div class="pf-title">{esc(ar.get("name"))}</div>
+      <div class="pf-sub">{esc(ar.get("outcome"))}</div>
+    </div>
+    <span class="state {ar.get("kind", "i")}">{esc(ar.get("title"))}</span>
+  </div>
+  <div class="pf-big {pnl_cls}">{signed_money(ar.get("pnl", 0))}</div>
+  <div class="pf-sub">{t("미실현손익", "Unrealized P&L")} · {signed_pct(ar.get("roi", 0))}</div>
+  <div class="pf-metrics">
+    <div class="pf-metric"><div class="k">{t("평가금", "Value")}</div><div class="v">{money(ar.get("value", 0))}</div></div>
+    <div class="pf-metric"><div class="k">{t("비중", "Weight")}</div><div class="v">{ar.get("pct", 0):.1f}%</div></div>
+    <div class="pf-metric"><div class="k">{t("현재가", "Now")}</div><div class="v">{ar.get("cur", 0):.1f}¢</div></div>
+    <div class="pf-metric"><div class="k">{t("평균가", "Avg")}</div><div class="v">{ar.get("buy", 0):.1f}¢</div></div>
+  </div>
+  <div class="pf-note">{esc(ar.get("summary"))}</div>
+</div>'''
+
+
 MIN_SHARES = 1.0   # 이 미만 수량은 dust로 간주
 MIN_VALUE = 1.0    # 평가금 $1 미만은 숨김
 
@@ -969,7 +1114,8 @@ def analyze_portfolio_position(p, bankroll):
                  f"Avg buy {buy:.1f}¢ · shares {sh:.2f} · side {outcome}")),
     ]
     return {"name": name, "outcome": outcome, "title": title, "kind": kind, "summary": summary,
-            "value": val, "pnl": pnl, "roi": roi, "pct": pct, "lines": lines_}
+            "value": val, "pnl": pnl, "roi": roi, "pct": pct,
+            "cur": cur, "buy": buy, "shares": sh, "investment": inv, "lines": lines_}
 
 
 # =====================================================
@@ -1433,25 +1579,55 @@ with tab4:
                     st.markdown(line(t(f"거래내역 불러오기 실패 — {e}", f"Activity import failed — {e}"), "b"), unsafe_allow_html=True)
 
         if st.session_state.auto_trades:
-            auto_view = pd.DataFrame([{
-                t("날짜", "Date"): tr["d"][:10],
-                t("시장", "Market"): tr["name"],
-                t("선택", "Outcome"): tr["outcome"],
-                t("매수/매도", "Side"): tr["side"],
-                t("가격", "Price"): cents(tr["price"]),
-                t("수량", "Shares"): tr["shares"],
-                t("금액", "Amount"): money(tr["amount"]),
-            } for tr in st.session_state.auto_trades])
-            st.dataframe(auto_view, use_container_width=True, hide_index=True)
-            csv_auto = auto_view.to_csv(index=False).encode("utf-8-sig")
-            ca, cb = st.columns(2)
-            with ca:
-                st.download_button(t("자동 거래내역 CSV", "Download auto trades CSV"), data=csv_auto, file_name="memento_auto_trades.csv", mime="text/csv", use_container_width=True)
-            with cb:
-                if st.button(t("자동 거래내역 비우기", "Clear auto trades"), use_container_width=True):
-                    st.session_state.auto_trades = []
-                    st.session_state.imported_tx_ids = []
-                    st.rerun()
+            sm = summarize_activity(st.session_state.auto_trades)
+            st.markdown(f'<div class="eyebrow" style="margin-top:16px;">{t("자동 거래 요약", "Auto trade summary")}</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="trade-grid">'
+                f'<div class="trade-card"><div class="k">{t("전체 체결", "Total fills")}</div><div class="v">{sm["count"]}</div></div>'
+                f'<div class="trade-card"><div class="k">{t("오늘 / 이번 주", "Today / week")}</div><div class="v">{sm["today_count"]} / {sm["week_count"]}</div></div>'
+                f'<div class="trade-card"><div class="k">BUY / SELL</div><div class="v">{sm["buy_count"]} / {sm["sell_count"]}</div></div>'
+                f'<div class="trade-card"><div class="k">{t("총 거래금액", "Turnover")}</div><div class="v">{money(sm["total_amount"])}</div></div>'
+                '</div>', unsafe_allow_html=True)
+
+            st.markdown(f'<div class="eyebrow">{t("거래 패턴 분석", "Trade pattern analysis")}</div>', unsafe_allow_html=True)
+            st.markdown(''.join(f'<div class="trade-insight"><span class="dot {kk}"></span>{esc(txt)}</div>' for kk, txt in sm["insights"]), unsafe_allow_html=True)
+
+            market_rows = activity_market_table(st.session_state.auto_trades)
+            if market_rows:
+                st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("시장별 거래 요약", "Market-level summary")}</div>', unsafe_allow_html=True)
+                market_view = pd.DataFrame([{
+                    t("시장", "Market"): r["market"],
+                    t("체결 수", "Fills"): r["count"],
+                    "BUY": r["buy"],
+                    "SELL": r["sell"],
+                    t("거래금액", "Turnover"): money(r["amount"]),
+                    t("최근 거래", "Last"): r["last"],
+                } for r in market_rows])
+                st.dataframe(market_view, use_container_width=True, hide_index=True)
+
+            with st.expander(t("원본 자동 거래내역", "Raw imported trade table"), expanded=False):
+                auto_view = pd.DataFrame([{
+                    t("날짜", "Date"): tr["d"][:16],
+                    t("시장", "Market"): tr["name"],
+                    t("선택", "Outcome"): tr["outcome"],
+                    t("매수/매도", "Side"): tr["side"],
+                    t("가격", "Price"): cents(tr["price"]),
+                    t("수량", "Shares"): tr["shares"],
+                    t("금액", "Amount"): money(tr["amount"]),
+                } for tr in st.session_state.auto_trades])
+                st.dataframe(auto_view, use_container_width=True, hide_index=True)
+                csv_auto = auto_view.to_csv(index=False).encode("utf-8-sig")
+                ca, cb = st.columns(2)
+                with ca:
+                    st.download_button(t("자동 거래내역 CSV", "Download auto trades CSV"), data=csv_auto, file_name="memento_auto_trades.csv", mime="text/csv", use_container_width=True)
+                with cb:
+                    if st.button(t("자동 거래내역 비우기", "Clear auto trades"), use_container_width=True):
+                        st.session_state.auto_trades = []
+                        st.session_state.imported_tx_ids = []
+                        st.rerun()
+        else:
+            st.markdown(f'<div class="footnote">{t("거래내역을 불러오면 자동 요약과 패턴 분석이 여기에 표시됩니다.", "Import activity to see automatic summaries and pattern analysis here.")}</div>', unsafe_allow_html=True)
+
         with st.expander(t("디버그 — activity raw 응답", "Debug — raw activity response")):
             st.json(st.session_state.activity_raw)
 
@@ -1589,19 +1765,26 @@ with tab_pf:
 
     st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("현재 보유 포지션", "Open positions")}</div>', unsafe_allow_html=True)
     if st.session_state.portfolio:
-        df = pd.DataFrame(st.session_state.portfolio)
-        col_cfg = {
-            "name": st.column_config.TextColumn(t("시장", "Market")),
-            "outcome": st.column_config.TextColumn(t("선택", "Side")),
-            "buy": st.column_config.NumberColumn(t("평균 매수가 (¢)", "Avg buy (¢)"), format="%.1f"),
-            "shares": st.column_config.NumberColumn(t("수량", "Shares"), format="%.2f"),
-            "inv": st.column_config.NumberColumn(t("투자금 ($)", "Cost ($)"), format="%.2f"),
-            "cur": st.column_config.NumberColumn(t("현재가 (¢)", "Now (¢)"), format="%.1f"),
-        }
-        edited = st.data_editor(df, column_config=col_cfg, use_container_width=True,
-                                hide_index=True, num_rows="dynamic", key="pf_editor")
-        st.session_state.portfolio = edited.to_dict("records")
-        st.markdown(f'<div class="footnote">{t("현재가·수량·투자금을 수정하면 아래 포지션별 판단과 자산 요약이 다시 계산됩니다.", "Edit price, shares or cost to recalculate the position verdicts and asset summary below.")}</div>', unsafe_allow_html=True)
+        cards = []
+        for p in st.session_state.portfolio:
+            ar = analyze_portfolio_position(p, bankroll_for_positions)
+            cards.append(portfolio_card_html(ar))
+        st.markdown('<div class="pf-grid">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="footnote">{t("카드는 현재가·평균가·수량·투자금만으로 자동 판단합니다. 아래 편집표에서 값을 고치면 즉시 다시 계산됩니다.", "Cards use price, average, shares and cost only. Edit the table below to recalculate instantly.")}</div>', unsafe_allow_html=True)
+
+        with st.expander(t("보유 포지션 편집표", "Edit open positions table"), expanded=False):
+            df = pd.DataFrame(st.session_state.portfolio)
+            col_cfg = {
+                "name": st.column_config.TextColumn(t("시장", "Market")),
+                "outcome": st.column_config.TextColumn(t("선택", "Side")),
+                "buy": st.column_config.NumberColumn(t("평균 매수가 (¢)", "Avg buy (¢)"), format="%.1f"),
+                "shares": st.column_config.NumberColumn(t("수량", "Shares"), format="%.2f"),
+                "inv": st.column_config.NumberColumn(t("투자금 ($)", "Cost ($)"), format="%.2f"),
+                "cur": st.column_config.NumberColumn(t("현재가 (¢)", "Now (¢)"), format="%.1f"),
+            }
+            edited = st.data_editor(df, column_config=col_cfg, use_container_width=True,
+                                    hide_index=True, num_rows="dynamic", key="pf_editor")
+            st.session_state.portfolio = edited.to_dict("records")
     else:
         st.markdown(
             f"""<div class="quiet" style="padding:36px 20px;">
@@ -1609,43 +1792,37 @@ with tab_pf:
 <div class="q-body">{t("위에서 지갑으로 불러오거나, 아래에서 직접 추가하세요.", "Import via wallet above, or add one manually below.")}</div>
 </div>""", unsafe_allow_html=True)
 
-    with st.form("add_pos"):
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            np_name = st.text_input(t("시장 이름", "Market name"), "")
-            np_out = st.text_input(t("선택한 결과", "Outcome"), "")
-        with a2:
-            np_buy = st.number_input(t("평균 매수가 (¢)", "Avg buy (¢)"), 0.1, 99.9, 50.0)
-            np_cur = st.number_input(t("현재가 (¢)", "Now (¢)"), 0.1, 100.0, 50.0)
-        with a3:
-            np_shares = st.number_input(t("보유 수량", "Shares"), 0.0, value=0.0)
-            np_inv = st.number_input(t("투자금 ($)", "Cost ($)"), 0.0, value=0.0)
-        add_pos = st.form_submit_button(t("포지션 추가", "Add position"), use_container_width=True)
+    with st.expander(t("수동으로 포지션 추가", "Add a position manually"), expanded=False):
+        with st.form("add_pos"):
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                np_name = st.text_input(t("시장 이름", "Market name"), "")
+                np_out = st.text_input(t("선택한 결과", "Outcome"), "")
+            with a2:
+                np_buy = st.number_input(t("평균 매수가 (¢)", "Avg buy (¢)"), 0.1, 99.9, 50.0)
+                np_cur = st.number_input(t("현재가 (¢)", "Now (¢)"), 0.1, 100.0, 50.0)
+            with a3:
+                np_shares = st.number_input(t("보유 수량", "Shares"), 0.0, value=0.0)
+                np_inv = st.number_input(t("투자금 ($)", "Cost ($)"), 0.0, value=0.0)
+            add_pos = st.form_submit_button(t("포지션 추가", "Add position"), use_container_width=True)
 
-    if add_pos:
-        if not np_name.strip():
-            st.markdown(line(t("시장 이름을 입력해주세요.", "Please enter a market name."), "w"), unsafe_allow_html=True)
-        else:
-            shares_v = np_shares if np_shares > 0 else (np_inv / (np_buy / 100) if np_buy > 0 else 0)
-            inv_v = np_inv if np_inv > 0 else shares_v * (np_buy / 100)
-            st.session_state.portfolio.append(dict(name=np_name, outcome=np_out, buy=np_buy,
-                                                   shares=round(shares_v, 2), inv=round(inv_v, 2), cur=np_cur))
-            st.rerun()
+        if add_pos:
+            if not np_name.strip():
+                st.markdown(line(t("시장 이름을 입력해주세요.", "Please enter a market name."), "w"), unsafe_allow_html=True)
+            else:
+                shares_v = np_shares if np_shares > 0 else (np_inv / (np_buy / 100) if np_buy > 0 else 0)
+                inv_v = np_inv if np_inv > 0 else shares_v * (np_buy / 100)
+                st.session_state.portfolio.append(dict(name=np_name, outcome=np_out, buy=np_buy,
+                                                       shares=round(shares_v, 2), inv=round(inv_v, 2), cur=np_cur))
+                st.rerun()
 
-    # ---- per-position analysis before asset analysis ----
-    st.markdown(f'<div class="eyebrow" style="margin-top:24px;">{t("포지션별 자동 분석", "Per-position analysis")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="eyebrow" style="margin-top:24px;">{t("포지션별 핵심 판단", "Per-position key verdicts")}</div>', unsafe_allow_html=True)
     if st.session_state.portfolio:
         for p in st.session_state.portfolio:
             ar = analyze_portfolio_position(p, bankroll_for_positions)
-            st.markdown(
-                f'<div class="spec" style="margin-bottom:14px;">'
-                f'<div class="spec-row"><div class="spec-key">{ar["name"]}<br><span style="color:var(--gray2);font-size:12px;">{ar["outcome"]}</span></div>'
-                f'<div class="spec-val"><b>{ar["title"]}</b><br>{ar["summary"]}</div>'
-                f'<div><span class="state {ar["kind"]}">{grade_word(ar["kind"])}</span></div></div>'
-                + "".join(spec_row("", txt, "", kk) for kk, txt in ar["lines"])
-                + '</div>', unsafe_allow_html=True)
+            st.markdown(line(f'<b>{esc(ar["name"])}</b> — {esc(ar["title"])} · {esc(ar["summary"])}', ar["kind"]), unsafe_allow_html=True)
     else:
-        st.markdown(f'<div class="footnote">{t("보유 포지션을 불러오면 각 배팅별 판단이 여기에 먼저 표시됩니다.", "Import holdings to see a verdict for each bet here first.")}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="footnote">{t("보유 포지션을 불러오면 각 배팅별 판단이 여기에 표시됩니다.", "Import holdings to see a verdict for each bet here.")}</div>', unsafe_allow_html=True)
 
     # ---- total assets after position analysis ----
     with st.expander(t("입출금 보정", "Deposit / withdrawal adjustment")):
