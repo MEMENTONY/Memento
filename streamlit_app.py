@@ -280,6 +280,7 @@ DEFAULTS = {
     "entry_url": "",
     "entry_markets": [],
     "entry_raw": {},
+    "ai_extra_context": "",
     "_entry_active": "",
     "explore_ai_text": "", "explore_ai_error": "", "explore_ai_prompt": "", "explore_ai_pair": "",
     "ai_text": "", "ai_error": "", "ai_prompt": "", "ai_pair": "",
@@ -698,7 +699,7 @@ def get_api_key():
             return k
     return None
 
-def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category="", market_name="", subcategory=""):
+def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category="", market_name="", subcategory="", bookmaker_prob=None, bookmaker_source_memo="", ai_extra_context=""):
     """Strict JSON Claude prompt for clean report-card rendering.
     Kept compatible with existing call sites.
     """
@@ -746,6 +747,9 @@ def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, cat
         "position_pct": last.get("position_pct"),
         "risk_score": last.get("final_score"),
         "recommended_cap": last.get("rec_cap"),
+        "bookmaker_probability": bookmaker_prob if bookmaker_prob not in (None, 0, 0.0, "") else None,
+        "bookmaker_source_memo": str(bookmaker_source_memo or "").strip() or None,
+        "user_extra_context_for_ai": str(ai_extra_context or "").strip() or None,
         "decision_from_app": last.get("decision"),
         "portfolio_count": len(st.session_state.get("portfolio", [])),
         "auto_trade_count": len(st.session_state.get("auto_trades", [])),
@@ -777,6 +781,8 @@ RULES:
 - Do not repeat '데이터 없음' outside missing_data.
 - Do not invent live scores, recent results, injuries, lineups, news, polls, or prices.
 - Use current_price/fair_price/edge/risk_score/recommended_cap from INPUT for price and action logic.
+- If bookmaker_probability is null, do NOT invent betting-site odds. Put bookmaker data in missing_data.
+- If bookmaker_source_memo or user_extra_context_for_ai exists, use it as user-provided context, but do not fabricate facts beyond it.
 - Action must be practical: enter/wait/avoid/trim/hold, max_size, invalidation.
 - {lang_line}
 """
@@ -988,16 +994,19 @@ def parse_list(v):
 
 
 WINNER_KW = (
-    "match winner", "match-winner", "game winner", "game-winner",
-    "series winner", "series-winner", "overall winner", "overall-winner",
-    "moneyline", "money line", "winner", "to win", "wins", "win the match",
-    "win this match", "win the game", "win the series", "will win", "which team will win"
+    "moneyline", "money line",
+    "match winner", "match-winner",
+    "series winner", "series-winner",
+    "overall winner", "overall-winner",
+    "game winner", "game-winner",
+    "winner", "to win", "wins", "will win",
+    "win the match", "win this match", "win the game", "win the series",
+    "which team will win"
 )
 PROP_KW = (
-    "correct score", "handicap", "spread", "over/under", "total", "o/u",
-    "points", "runs", "first to", "first map", "first inning", "margin", "exact score"
+    "spread", "total", "over/under", "o/u", "correct score", "handicap",
+    "points", "first to", "first map", "first inning", "margin", "exact score"
 )
-BINARY_OUTCOMES = {"yes", "no", "atl", "cws", "home", "away"}
 
 
 def is_prop_market(q, outcome=""):
@@ -1005,13 +1014,17 @@ def is_prop_market(q, outcome=""):
     return any(k in s for k in PROP_KW)
 
 
-def is_relevant_market(q, outcome=""):
-    """Prefer single match/series/overall winner markets. Fallback is handled in extract_markets."""
-    s = f"{q or ''} {outcome or ''}".lower()
+def is_relevant_market(q, outcome="", event_title=""):
+    """Winner/moneyline detector. Event title is included so MLB/simple binary markets survive."""
+    s = f"{event_title or ''} {q or ''} {outcome or ''}".lower()
     if not s.strip() or is_prop_market(q, outcome):
         return False
     return any(k in s for k in WINNER_KW)
 
+
+def is_binary_winner_fallback(q, outcome=""):
+    """Fallback for sports pages where the full-game moneyline is just a 2-outcome market without winner wording."""
+    return not is_prop_market(q, outcome)
 
 def _event_resolution(event, market):
     return (
@@ -1045,7 +1058,8 @@ def extract_markets(payload):
         for m in (event.get("markets") or []):
             if not isinstance(m, dict):
                 continue
-            q = m.get("question") or m.get("title") or m.get("slug") or event.get("title") or event.get("slug") or "Unknown"
+            event_title = event.get("title") or event.get("slug") or ""
+            q = m.get("question") or m.get("title") or m.get("slug") or event_title or "Unknown"
             outs = parse_list(m.get("outcomes"))
             prices = parse_list(m.get("outcomePrices"))
             tokens = parse_list(m.get("clobTokenIds"))
@@ -1068,18 +1082,25 @@ def extract_markets(payload):
                     "liquidity": _event_liquidity(event, m),
                     "endDate": _event_end_date(event, m),
                     "resolution": _event_resolution(event, m),
+                    "event_title": event_title,
                     "_binary": is_binary,
                     "_prop": is_prop_market(q, o),
                 }
                 all_rows.append(row)
-                if is_relevant_market(q, o):
+                if is_relevant_market(q, o, event_title):
                     winner_rows.append(row)
-                elif is_binary and not row["_prop"]:
+                if is_binary and is_binary_winner_fallback(q, o):
                     binary_rows.append(row)
 
-    # MLB/sports pages often have simple binary markets without explicit "winner" wording.
+    # Winner rows first. Also include binary non-prop rows so full-game/overall moneyline is not lost.
     if winner_rows:
-        return winner_rows
+        merged, seen = [], set()
+        for r in winner_rows + binary_rows:
+            key = (r.get(t("시장", "Market")), r.get(t("선택지", "Outcome")), r.get("token_id"))
+            if key not in seen:
+                seen.add(key)
+                merged.append(r)
+        return merged
     if binary_rows:
         return binary_rows
     return all_rows
@@ -1969,9 +1990,8 @@ st.markdown(
     f'{t("감정 한도", "cap")} {money(prof["emotional_limit"])}</div>',
     unsafe_allow_html=True)
 
-tab1, tab_explore, tab_pf, tab2, tab3, tab4, tab_set = st.tabs([
+tab1, tab_pf, tab2, tab3, tab4, tab_set = st.tabs([
     t("진입 판독", "Entry check"),
-    t("시장 탐색", "Market explorer"),
     t("포트폴리오", "Portfolio"),
     t("포지션 관리", "Positions"),
     t("부분매도", "Partial sell"),
@@ -2194,6 +2214,9 @@ def analyze_entry_row(row, stake, fair_price, confidence, purpose, category, sub
         category,
         f"{q} — {o}",
         subcategory,
+        bookmaker_prob=float(adv.get("bookmaker_prob", 0.0) or 0.0),
+        bookmaker_source_memo=str(adv.get("bookmaker_source_memo", "") or ""),
+        ai_extra_context=str(adv.get("ai_extra_context", "") or ""),
     )
     prompt += "\n\nAPP_RESULT=" + json.dumps({
         "decision": result.get("decision"),
@@ -2205,9 +2228,13 @@ def analyze_entry_row(row, stake, fair_price, confidence, purpose, category, sub
         "position_pct": result.get("position_pct"),
         "recommended_cap": result.get("rec_cap"),
         "token_id": tok,
+        "bookmaker_prob": float(adv.get("bookmaker_prob", 0.0) or 0.0),
+        "bookmaker_source_memo": str(adv.get("bookmaker_source_memo", "") or ""),
+        "ai_extra_context": str(adv.get("ai_extra_context", "") or ""),
         "url": st.session_state.get("entry_url", ""),
     }, ensure_ascii=False)
 
+    st.session_state.ai_extra_context = str(adv.get("ai_extra_context", "") or "")
     st.session_state.ai_prompt = prompt
     st.session_state.ai_pair = f"{q} — {o}"
     try:
@@ -2334,6 +2361,20 @@ with tab1:
                     with a3:
                         adv["previous_good_price"] = st.number_input(t("처음 본 가격 (¢)", "First-seen price (¢)"), min_value=0.0, max_value=99.0, value=0.0, key=f"url_first_{idx}_{keytok}")
                         adv["fomo_count"] = st.slider(t("감정 체크", "Emotion"), 0, 7, 0, key=f"url_fomo_{idx}_{keytok}")
+                    adv["bookmaker_source_memo"] = st.text_input(
+                        t("배팅사이트/외부배당 메모", "Bookmaker / outside-odds memo"),
+                        value="",
+                        placeholder=t("예: Pinnacle T1 45%, Bet365 Gen.G 우세 등", "e.g. Pinnacle T1 45%, Bet365 favors Gen.G"),
+                        key=f"url_book_src_{idx}_{keytok}",
+                    )
+                    adv["ai_extra_context"] = st.text_area(
+                        t("AI 추가 정보 / 검색 메모", "Extra context for AI"),
+                        value=st.session_state.get("ai_extra_context", ""),
+                        height=90,
+                        placeholder=t("로스터, 부상, 최근 폼, 뉴스, 직접 확인한 배당 등을 넣으면 AI 보고서가 더 정확해집니다.",
+                                      "Lineups, injuries, form, news, or odds you checked. Helps the AI report."),
+                        key=f"url_ai_ctx_{idx}_{keytok}",
+                    )
 
                 go = st.form_submit_button(t("분석", "Analyze"), use_container_width=True)
 
