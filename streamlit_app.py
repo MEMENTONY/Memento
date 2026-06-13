@@ -290,6 +290,9 @@ DEFAULTS = {
     "wallet_addr": "",
     "imported_tx_ids": [],
     "watchlist": [],
+    "watching_market": {},
+    "live_price_cache": {},
+    "price_history_cache": {},
     "order_candidates": [],
     "explore_book_raw": {},
     "explore_history_raw": {},
@@ -993,38 +996,51 @@ def parse_list(v):
     return []
 
 
-WINNER_KW = (
+P1_KW = (
     "moneyline", "money line",
     "match winner", "match-winner",
     "series winner", "series-winner",
     "overall winner", "overall-winner",
-    "game winner", "game-winner",
-    "winner", "to win", "wins", "will win",
-    "win the match", "win this match", "win the game", "win the series",
-    "which team will win"
+    "to win", "winner", "will win", "wins",
+    "win the match", "win this match", "win the series",
+)
+P2_KW = (
+    "game winner", "game-winner", "map winner", "map-winner",
+    "win the game", "game 1 winner", "game 2 winner", "game 3 winner", "map 1 winner", "map 2 winner",
 )
 PROP_KW = (
-    "spread", "total", "over/under", "o/u", "correct score", "handicap",
-    "points", "first to", "first map", "first inning", "margin", "exact score"
+    "first blood", "handicap", "spread", "total", "over/under", "o/u",
+    "correct score", "kills", "kill", "towers", "tower", "dragon", "baron",
+    "map score", "inhibitor", "first to", "points", "margin", "exact score",
+    "first map", "first inning",
 )
+
+
+def classify_market_type(question, outcome="", category=""):
+    """Classify Polymarket markets. P1 full winner first, P2 game/map winner second, props excluded."""
+    s = f"{category or ''} {question or ''} {outcome or ''}".lower()
+    if any(k in s for k in PROP_KW):
+        return "prop"
+    if any(k in s for k in P2_KW):
+        return "p2_game"
+    if any(k in s for k in P1_KW):
+        return "p1_winner"
+    return "other"
 
 
 def is_prop_market(q, outcome=""):
-    s = f"{q or ''} {outcome or ''}".lower()
-    return any(k in s for k in PROP_KW)
+    return classify_market_type(q, outcome) == "prop"
 
 
 def is_relevant_market(q, outcome="", event_title=""):
-    """Winner/moneyline detector. Event title is included so MLB/simple binary markets survive."""
-    s = f"{event_title or ''} {q or ''} {outcome or ''}".lower()
-    if not s.strip() or is_prop_market(q, outcome):
-        return False
-    return any(k in s for k in WINNER_KW)
+    cls = classify_market_type(f"{event_title or ''} {q or ''}", outcome)
+    return cls in ("p1_winner", "p2_game")
 
 
 def is_binary_winner_fallback(q, outcome=""):
-    """Fallback for sports pages where the full-game moneyline is just a 2-outcome market without winner wording."""
+    """Fallback for full-game moneyline pages that expose only two outcomes without winner wording."""
     return not is_prop_market(q, outcome)
+
 
 def _event_resolution(event, market):
     return (
@@ -1045,20 +1061,20 @@ def _event_end_date(event, market):
     return market.get("endDate") or market.get("endDateIso") or event.get("endDate") or event.get("endDateIso") or ""
 
 
-def extract_markets(payload):
-    """Extract market rows. Winner markets first; if none, fallback to binary non-prop markets."""
+def extract_markets(payload, category=""):
+    """P1 full winner first, then P2 game/map winner. Props never shown. Fallback: binary non-prop."""
     events = payload if isinstance(payload, list) else payload.get("events", []) if isinstance(payload, dict) else []
     if not isinstance(events, list):
         return []
 
-    all_rows, winner_rows, binary_rows = [], [], []
+    p1_rows, p2_rows, binary_rows = [], [], []
     for event in events:
         if not isinstance(event, dict):
             continue
+        event_title = event.get("title") or event.get("slug") or ""
         for m in (event.get("markets") or []):
             if not isinstance(m, dict):
                 continue
-            event_title = event.get("title") or event.get("slug") or ""
             q = m.get("question") or m.get("title") or m.get("slug") or event_title or "Unknown"
             outs = parse_list(m.get("outcomes"))
             prices = parse_list(m.get("outcomePrices"))
@@ -1066,6 +1082,9 @@ def extract_markets(payload):
             if not outs:
                 continue
             is_binary = len(outs) == 2
+            cls = classify_market_type(f"{event_title} {q}", "", category)
+            if cls == "prop":
+                continue
             for i, o in enumerate(outs):
                 price = None
                 if i < len(prices):
@@ -1084,26 +1103,33 @@ def extract_markets(payload):
                     "resolution": _event_resolution(event, m),
                     "event_title": event_title,
                     "_binary": is_binary,
-                    "_prop": is_prop_market(q, o),
+                    "_class": cls,
                 }
-                all_rows.append(row)
-                if is_relevant_market(q, o, event_title):
-                    winner_rows.append(row)
+                if cls == "p1_winner":
+                    p1_rows.append(row)
+                elif cls == "p2_game":
+                    p2_rows.append(row)
                 if is_binary and is_binary_winner_fallback(q, o):
                     binary_rows.append(row)
 
-    # Winner rows first. Also include binary non-prop rows so full-game/overall moneyline is not lost.
-    if winner_rows:
+    ordered = p1_rows + p2_rows
+    if ordered:
         merged, seen = [], set()
-        for r in winner_rows + binary_rows:
+        for r in ordered:
             key = (r.get(t("시장", "Market")), r.get(t("선택지", "Outcome")), r.get("token_id"))
             if key not in seen:
                 seen.add(key)
                 merged.append(r)
         return merged
     if binary_rows:
-        return binary_rows
-    return all_rows
+        merged, seen = [], set()
+        for r in binary_rows:
+            key = (r.get(t("시장", "Market")), r.get(t("선택지", "Outcome")), r.get("token_id"))
+            if key not in seen:
+                seen.add(key)
+                merged.append(r)
+        return merged
+    return []
 
 
 def infer_market_category(url="", name=""):
@@ -1209,26 +1235,137 @@ def fetch_clob_book(token_id):
         return {"error": str(e)}
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_price_history(token_id):
-    """Read-only price history. Endpoint/field may vary; keep raw for debug."""
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_live_token_price(token_id):
+    """Return live bid/ask/mid/spread in cents. Fails soft and never calls Claude."""
     token_id = str(token_id or "").strip()
     if not token_id:
-        return {}
+        return None
+    # First try the existing quote endpoints. They are more stable than raw book shape.
+    try:
+        q = fetch_clob_price(token_id)
+        bid, ask, spread = q.get("bid"), q.get("ask"), q.get("spread")
+        mid = round((float(bid) + float(ask)) / 2, 2) if bid is not None and ask is not None else (bid if bid is not None else ask)
+        if mid is not None:
+            return {"bid": bid, "ask": ask, "mid": mid, "spread": spread, "source": "price"}
+    except Exception:
+        pass
+    # Fallback to book. The JSON shape can differ, so parse defensively.
+    try:
+        book = fetch_clob_book(token_id)
+        bids = book.get("bids") or [] if isinstance(book, dict) else []
+        asks = book.get("asks") or [] if isinstance(book, dict) else []
+        def _price(x):
+            if isinstance(x, dict):
+                return _as_cents(x.get("price"))
+            if isinstance(x, (list, tuple)) and x:
+                return _as_cents(x[0])
+            return None
+        bid_prices = [p for p in (_price(x) for x in bids) if p is not None]
+        ask_prices = [p for p in (_price(x) for x in asks) if p is not None]
+        bid = max(bid_prices) if bid_prices else None
+        ask = min(ask_prices) if ask_prices else None
+        mid = round((bid + ask) / 2, 2) if bid is not None and ask is not None else (bid if bid is not None else ask)
+        spread = round(ask - bid, 2) if bid is not None and ask is not None else None
+        return {"bid": bid, "ask": ask, "mid": mid, "spread": spread, "source": "book"} if mid is not None else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_price_history(token_id):
+    """Return list[{t,p}] in cents. Endpoint shape may vary; fails soft."""
+    token_id = str(token_id or "").strip()
+    if not token_id:
+        return []
     attempts = [
-        ("https://clob.polymarket.com/prices-history", {"market": token_id, "interval": "1d", "fidelity": 60}),
-        ("https://clob.polymarket.com/prices-history", {"market": token_id, "fidelity": 60}),
+        ("https://clob.polymarket.com/prices-history", {"market": token_id, "interval": "1d", "fidelity": 15}),
+        ("https://clob.polymarket.com/prices-history", {"market": token_id, "fidelity": 15}),
     ]
-    last_err = ""
     for base, params in attempts:
         try:
             url = base + "?" + urllib.parse.urlencode(params)
             req = urllib.request.Request(url, headers={"User-Agent": "Memento/5.0", "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except Exception as e:
-            last_err = str(e)
-    return {"error": last_err}
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            hist = d.get("history") if isinstance(d, dict) else d
+            if not isinstance(hist, list):
+                hist = []
+            out = []
+            for p in hist:
+                if not isinstance(p, dict):
+                    continue
+                raw_price = p.get("p", p.get("price", p.get("value")))
+                pc = _as_cents(raw_price)
+                if pc is None:
+                    continue
+                out.append({"t": p.get("t", p.get("timestamp", len(out))), "p": round(pc, 2)})
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+
+
+def evaluate_live_price(entry_result, live_price):
+    """Deterministic live re-evaluation. Does not call Claude."""
+    entry_result = entry_result if isinstance(entry_result, dict) else {}
+    fair = float(entry_result.get("fair_price") or st.session_state.get("watching_market", {}).get("fair_price") or 0)
+    entry_p = float(entry_result.get("current_price") or st.session_state.get("watching_market", {}).get("entry_price") or 0)
+    target = float(entry_result.get("target_price") or 999)
+    edge = fair - float(live_price)
+    move = float(live_price) - entry_p
+    if live_price >= target:
+        status, kind = t("익절 구간", "Take-profit zone"), "w"
+    elif fair and live_price >= fair:
+        status, kind = t("비쌈 — 진입 불리", "Expensive — worse entry"), "b"
+    elif edge >= 8:
+        status, kind = t("저평가 — 진입 유리", "Cheap — better entry"), "g"
+    elif edge >= 3:
+        status, kind = t("약간 저평가", "Slightly cheap"), "w"
+    else:
+        status, kind = t("적정", "Fair"), "i"
+    return {"edge": edge, "move": move, "status": status, "kind": kind, "implied": live_price, "fair": fair}
+
+
+def render_live_price_panel(wm):
+    """Show live quote, deterministic edge update, and optional history chart under analysis result."""
+    wm = wm if isinstance(wm, dict) else {}
+    tok = str(wm.get("token_id", "") or "")
+    r = st.session_state.get("last_entry", {}) if isinstance(st.session_state.get("last_entry", {}), dict) else {}
+    if not tok:
+        st.markdown(line(t("실시간 추적 token_id가 없습니다.", "No token_id for live tracking."), "w"), unsafe_allow_html=True)
+        return
+    c1, c2 = st.columns([3, 1])
+    with c2:
+        if st.button(t("새로고침", "Refresh"), key=f"live_refresh_{tok}", use_container_width=True):
+            try:
+                fetch_live_token_price.clear()
+                fetch_price_history.clear()
+            except Exception:
+                pass
+            st.rerun()
+    lp = fetch_live_token_price(tok)
+    if not lp or lp.get("mid") is None:
+        st.markdown(line(t("실시간 호가 없음 — Polymarket에서 직접 확인 필요.", "No live book — verify on Polymarket."), "w"), unsafe_allow_html=True)
+        return
+    live = float(lp["mid"])
+    ev = evaluate_live_price(r, live)
+    st.markdown(
+        '<div class="stats">'
+        + stat(t("실시간 중간가", "Live mid"), cents(live), t(f"분석시 {cents(wm.get('entry_price', 0))}", f"at analysis {cents(wm.get('entry_price', 0))}"))
+        + stat("Bid / Ask", f"{cents(float(lp['bid'])) if lp.get('bid') is not None else '—'} / {cents(float(lp['ask'])) if lp.get('ask') is not None else '—'}", f"{t('스프레드','spread')} {cents(float(lp['spread'])) if lp.get('spread') is not None else '—'}")
+        + stat(t("실시간 Edge", "Live edge"), f"{ev['edge']:+.1f}¢", t("적정가 대비", "vs fair"), "pos" if ev['edge'] >= 3 else "neg" if ev['edge'] < 0 else "")
+        + stat(t("분석 후 변동", "Move since"), f"{ev['move']:+.1f}¢", t("시장 가격 변화", "market move"), "pos" if ev['move'] >= 0 else "neg")
+        + "</div>", unsafe_allow_html=True)
+    st.markdown(meter(t("시장 판단 vs 내 판단", "Market view vs my view"), live, ev["kind"], ev["status"], unit="¢"), unsafe_allow_html=True)
+    hist = fetch_price_history(tok)
+    if hist:
+        try:
+            dfh = pd.DataFrame(hist)
+            st.line_chart(dfh.set_index("t")["p"], height=160)
+        except Exception:
+            pass
 
 
 def _first_present(obj, keys, default=""):
@@ -2203,6 +2340,17 @@ def analyze_entry_row(row, stake, fair_price, confidence, purpose, category, sub
         "note": str(subcategory or ""),
         "stake": float(stake),
     }
+    st.session_state.watching_market = {
+        "market": f"{q} — {o}",
+        "outcome": o,
+        "token_id": tok,
+        "entry_price": price,
+        "fair_price": float(fair_price),
+        "stake": float(stake),
+        "category": category,
+        "subcategory": subcategory,
+        "analyzed_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
     prompt = build_prompt(
         o,
@@ -2275,7 +2423,7 @@ with tab1:
             try:
                 with st.spinner(t("시장 정보를 불러오는 중", "Fetching market data")):
                     payload = fetch_gamma(slug)
-                    rows = extract_markets(payload)
+                    rows = extract_markets(payload, infer_market_category(entry_url_value, ""))
                 st.session_state.entry_raw = payload
                 st.session_state.entry_markets = rows
                 st.session_state.explore_raw = payload
@@ -2393,6 +2541,10 @@ with tab1:
                     st.markdown(line(t(f"AI 실패 ({st.session_state.ai_error})", f"AI failed ({st.session_state.ai_error})"), "w"), unsafe_allow_html=True)
                     if st.session_state.get("ai_prompt"):
                         st.code(st.session_state.ai_prompt)
+
+                if st.session_state.get("watching_market", {}).get("token_id"):
+                    st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("실시간 가격 추적", "Live price watch")}</div>', unsafe_allow_html=True)
+                    render_live_price_panel(st.session_state.watching_market)
 
             st.markdown("<hr>", unsafe_allow_html=True)
 
@@ -2921,7 +3073,7 @@ with tab_set:
             try:
                 with st.spinner(t("불러오는 중", "Fetching")):
                     payload = fetch_gamma(slug)
-                rows = extract_markets(payload)
+                rows = extract_markets(payload, infer_market_category(url, ""))
                 st.session_state.url_rows = rows
                 if not rows:
                     st.markdown(line(t("시장을 찾지 못했습니다. /event/ URL인지 확인해주세요.", "No markets found. Check it's an /event/ URL."), "w"), unsafe_allow_html=True)
