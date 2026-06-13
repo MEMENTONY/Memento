@@ -168,7 +168,7 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 26px 0; }
 .pf-sub { margin-top: 5px; font-size: 12.5px; color: var(--gray); line-height: 1.45; }
 .pf-big { font-size: 28px; font-weight: 650; letter-spacing: -.03em; font-variant-numeric: tabular-nums; margin: 4px 0 2px 0; }
 .pf-big.pos { color: var(--green); } .pf-big.neg { color: var(--red); }
-.pf-metrics { display:grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0; }
+.pf-metrics { display:grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 14px 0; }
 .pf-metric { border-top: 1px solid var(--hairline); padding-top: 10px; min-width: 0; }
 .pf-metric .k { font-size: 11.5px; color: var(--gray); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pf-metric .v { margin-top: 4px; font-size: 14px; font-weight: 600; color: var(--ink2); font-variant-numeric: tabular-nums; }
@@ -179,6 +179,24 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 26px 0; }
 .trade-card .v { margin-top: 6px; font-size: 24px; font-weight: 650; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
 .trade-insight { border-top: 1px solid var(--hairline); padding: 13px 0; font-size: 14px; line-height: 1.6; color: var(--ink2); }
 .trade-insight:first-child { border-top: none; }
+
+.profile-hero { border: 1px solid var(--hairline); border-radius: 22px; padding: 22px; background: linear-gradient(180deg,#fff 0%,#fafafa 100%); margin: 14px 0 24px 0; }
+.profile-hero-head { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; margin-bottom: 16px; }
+.profile-hero .title { font-size: 17px; font-weight: 700; letter-spacing: -.018em; }
+.profile-hero .sub { margin-top: 5px; font-size: 12.5px; color: var(--gray); line-height: 1.5; }
+.profile-grid { display:grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.profile-cell { border-top: 1px solid var(--hairline); padding-top: 12px; min-width: 0; }
+.profile-cell .k { font-size: 11.5px; color: var(--gray); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.profile-cell .v { margin-top: 5px; font-size: 19px; font-weight: 700; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+.profile-cell .v.pos { color: var(--green); } .profile-cell .v.neg { color: var(--red); }
+.ai-report-grid { display:grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 12px; }
+.ai-report-card { border: 1px solid var(--hairline); border-radius: 16px; padding: 16px; background:#fff; }
+.ai-report-card .a-key { font-size: 12px; font-weight: 700; color: var(--gray); letter-spacing: .05em; text-transform: uppercase; }
+.ai-report-card .a-body { margin-top: 8px; font-size: 14px; line-height: 1.65; color: var(--ink2); }
+@media (max-width: 880px) {
+  .profile-grid { grid-template-columns: repeat(2, 1fr); }
+  .ai-report-grid { grid-template-columns: 1fr; }
+}
 @media (max-width: 880px) {
   .pf-grid { grid-template-columns: 1fr; }
   .pf-metrics { grid-template-columns: repeat(2, 1fr); }
@@ -225,6 +243,9 @@ DEFAULTS = {
     "auto_trades": [],
     "wallet_addr": "",
     "imported_tx_ids": [],
+    "habit_cache": {},
+    "pnl_raw": {},
+    "profile_pnl": {},
     "reviews": [],
 }
 for k, v in DEFAULTS.items():
@@ -626,27 +647,56 @@ def get_api_key():
             return k
     return None
 
-def build_prompt(team_a, team_b, league, current_price, fair_price, purpose):
+def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category="", market_name=""):
+    """Category-aware Claude report prompt for Polymarket markets."""
     lang_line = "한국어로 답변해주세요." if st.session_state.lang == "ko" else "Answer in English."
-    return f"""당신은 LoL e스포츠 배팅 분석 전문가입니다. 아래 경기를 배팅 관점에서 분석해주세요.
+    category = str(category or t("기타", "Other"))
+    market_name = str(market_name or "").strip() or (f"{team_a} vs {team_b}" if str(team_b).strip() else str(team_a).strip())
+    edge = fair_price - current_price
+    cat_low = category.lower()
 
-경기: {team_a} vs {team_b}
-리그: {league}
-{team_a}의 현재 Polymarket 배당: {current_price}¢
-사용자의 적정가 추정: {fair_price}¢
+    if any(x in cat_low for x in ["match", "game", "score", "sport", "sports", "winner", "esports", "lck", "lol", "moneyline"]):
+        category_hint = """시장 유형: 스포츠/경기형 또는 e스포츠.
+분석 초점: 팀/선수 전력, 부상·로스터, 최근 폼, 일정, 배당 괴리, 경기 전 가격 변동성.
+최신 전적·부상·라인업 데이터가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+    elif any(x in cat_low for x in ["정치", "politic", "election", "선거"]):
+        category_hint = """시장 유형: 정치/선거.
+분석 초점: resolution 기준, 여론조사 리스크, 후보/정당 변수, 일정, 개표·공식 결과 기준, 표본 오류.
+최신 여론조사·공식 정보가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+    elif any(x in cat_low for x in ["뉴스", "news", "event", "이벤트"]):
+        category_hint = """시장 유형: 뉴스/이벤트.
+분석 초점: 조건문, resolution 기준, 발표 시점, 정보 선반영 여부, 유동성, 반대 시나리오.
+최신 뉴스가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+    else:
+        category_hint = """시장 유형: 기타 Polymarket 시장.
+분석 초점: 조건문, resolution 기준, 가격 왜곡, 유동성, 변동성, 정보 부족.
+제공되지 않은 사실은 만들지 말고 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+
+    return f"""당신은 Polymarket prediction market 리스크 분석가입니다.
+LoL 전용 분석가처럼 행동하지 말고, 시장 유형에 맞는 짧은 보고서를 작성하세요.
+모르는 최신 정보·전적·뉴스·여론조사는 절대 추측하지 말고 \"데이터 없음/직접 확인 필요\"라고 쓰세요.
+이 답변은 투자 조언이 아니라 리스크 점검용입니다.
+
+시장명: {market_name}
+시장 유형/카테고리: {category}
+분류/리그/메모: {league}
+대상 A: {team_a}
+대상 B: {team_b}
+현재 Polymarket 가격: {current_price}¢
+사용자 적정가 추정: {fair_price}¢
+가격 차이: {edge:+.1f}¢
 배팅 목적: {purpose}
 
-아래 6개 항목을 순서대로, 각 항목 앞에 "1." 형식 번호를 붙여서, 항목당 2~3문장으로 분석해주세요.
+{category_hint}
 
-1. 리그 순위 — {league} 기준 두 팀의 현재 순위
-2. 시즌 전적 — 각 팀의 승패 기록
-3. 최근 폼 — 최근 5경기 흐름, 연승·연패 여부
-4. 상대 전적 — 두 팀의 직접 맞대결 기록
-5. 팀 변수 — 로스터, 부진 선수, 특이사항
-6. 가격 판단 — {current_price}¢ 배당이 실제 승률 대비 싼지 비싼지
+반드시 아래 4개 섹션 제목을 그대로 사용하세요. 각 섹션은 2~3문장 이내로 짧게.
+1. 핵심 요약
+2. 주요 리스크
+3. 가격 판단
+4. 진입/홀딩/관망 의견
 
-중요: 최신 순위·전적 데이터가 제공되지 않았으면 추측하지 말고 "데이터 없음/직접 확인 필요"라고 쓰세요.
-마지막 줄은 반드시 이 형식으로: 결론: 배팅 추천 / 비추천 / 중립 중 하나
+마지막 줄은 반드시 이 형식으로 쓰세요:
+결론: 배팅 추천 / 비추천 / 중립
 {lang_line}"""
 
 def call_claude(prompt):
@@ -671,22 +721,44 @@ def call_claude(prompt):
     except Exception as e:
         return None, str(e)
 
-def render_ai(text):
-    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    title, body, blocks, verdict = "", [], [], ""
-    for l in lines:
-        if len(l) > 2 and l[0].isdigit() and l[1] == ".":
-            if title: blocks.append((title, " ".join(body)))
-            title, body = l, []
-        elif l.startswith("결론") or l.lower().startswith(("conclusion", "verdict")):
-            if title:
-                blocks.append((title, " ".join(body)))
-                title, body = "", []
-            verdict = l
+def render_ai_report(text):
+    """Render Claude output as a compact four-section report."""
+    raw_lines = [l.strip() for l in str(text or "").strip().split("\n") if l.strip()]
+    if not raw_lines:
+        return
+    wanted = ["핵심 요약", "주요 리스크", "가격 판단", "진입/홀딩/관망 의견"] if st.session_state.lang == "ko" else ["Summary", "Key risks", "Price view", "Action view"]
+    key_map = {
+        "핵심 요약": wanted[0], "summary": wanted[0], "핵심요약": wanted[0],
+        "주요 리스크": wanted[1], "리스크": wanted[1], "key risks": wanted[1], "risk": wanted[1],
+        "가격 판단": wanted[2], "가격판단": wanted[2], "price": wanted[2], "price view": wanted[2],
+        "진입/홀딩/관망 의견": wanted[3], "진입": wanted[3], "홀딩": wanted[3], "관망": wanted[3], "action": wanted[3], "opinion": wanted[3],
+    }
+    sections = {w: [] for w in wanted}
+    current = None
+    verdict = ""
+    for line_ in raw_lines:
+        low = line_.lower().strip(" -*#0123456789.:")
+        if line_.startswith("결론") or low.startswith(("conclusion", "verdict")):
+            verdict = line_
+            current = None
+            continue
+        found = None
+        clean_title = line_.strip(" -*#")
+        clean_title = clean_title.split(".", 1)[-1].strip() if clean_title[:1].isdigit() else clean_title
+        base = clean_title.split(":", 1)[0].strip().lower()
+        for k, v in key_map.items():
+            if k in base:
+                found = v
+                break
+        if found:
+            current = found
+            rest = clean_title.split(":", 1)[1].strip() if ":" in clean_title else ""
+            if rest:
+                sections[current].append(rest)
+        elif current:
+            sections[current].append(line_)
         else:
-            body.append(l)
-    if title and body: blocks.append((title, " ".join(body)))
-
+            sections[wanted[0]].append(line_)
     if verdict:
         low = verdict.lower()
         is_no = "비추천" in verdict or "not recommend" in low or "avoid" in low
@@ -694,10 +766,17 @@ def render_ai(text):
         kind = "g" if is_yes else "b" if is_no else "w"
         clean = verdict.split(":", 1)[-1].strip()
         st.markdown(f"""<div class="verdict" style="border-top:none;padding-top:6px;">
-<div class="v-title" style="font-size:28px;"><span class="dot {kind}"></span>{clean}</div>
-<div class="v-sub">{t("Claude 분석 결론", "Claude's conclusion")}</div></div>""", unsafe_allow_html=True)
-    for tt, b in blocks:
-        st.markdown(f'<div class="ai-block"><div class="a-key">{tt}</div><div class="a-body">{b}</div></div>', unsafe_allow_html=True)
+<div class="v-title" style="font-size:28px;"><span class="dot {kind}"></span>{esc(clean)}</div>
+<div class="v-sub">{t("AI 보고서 결론", "AI report conclusion")}</div></div>""", unsafe_allow_html=True)
+    cards = []
+    for title_ in wanted:
+        body = " ".join(sections.get(title_, [])).strip() or t("데이터 없음/직접 확인 필요", "No data / verify manually")
+        cards.append(f'<div class="ai-report-card"><div class="a-key">{esc(title_)}</div><div class="a-body">{esc(body)}</div></div>')
+    st.markdown('<div class="ai-report-grid">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+
+
+def render_ai(text):
+    render_ai_report(text)
 
 
 # =====================================================
@@ -745,6 +824,96 @@ def fetch_wallet_positions(addr):
     req = urllib.request.Request(api, headers={"User-Agent": "Memento/5.0", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=12) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_wallet_value(addr):
+    api = f"https://data-api.polymarket.com/value?user={urllib.parse.quote(addr)}"
+    req = urllib.request.Request(api, headers={"User-Agent": "Memento/5.0", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _find_first_number(obj, keys):
+    if isinstance(obj, dict):
+        lower = {str(k).lower(): v for k, v in obj.items()}
+        for k in keys:
+            if k.lower() in lower:
+                val = _safe_float(lower[k.lower()], None)
+                if val is not None:
+                    return val
+        for v in obj.values():
+            got = _find_first_number(v, keys)
+            if got is not None:
+                return got
+    elif isinstance(obj, list):
+        for v in obj:
+            got = _find_first_number(v, keys)
+            if got is not None:
+                return got
+    return None
+
+
+def calc_profile_pnl(portfolio, cash, raw_positions=None, raw_value=None):
+    raw_positions = raw_positions if isinstance(raw_positions, list) else []
+    pos_value_local = sum(_safe_float(p.get("shares"), 0) * (_safe_float(p.get("cur"), 0) / 100) for p in portfolio)
+    pos_cost_local = sum(_safe_float(p.get("inv"), 0) for p in portfolio)
+    value_api = _find_first_number(raw_value, ["value", "positionValue", "positionsValue", "totalValue", "currentValue"])
+    pos_value = value_api if value_api is not None and value_api >= 0 else pos_value_local
+    raw_initial = sum(_safe_float(it.get("initialValue"), 0) for it in raw_positions)
+    raw_current = sum(_safe_float(it.get("currentValue"), 0) for it in raw_positions)
+    raw_realized = sum(_safe_float(it.get("realizedPnl"), 0) for it in raw_positions)
+    raw_cash = sum(_safe_float(it.get("cashPnl"), 0) for it in raw_positions)
+    raw_percent = _find_first_number(raw_positions, ["percentPnl", "percentRealizedPnl", "percentCashPnl"])
+    cost = raw_initial if raw_initial > 0 else pos_cost_local
+    if raw_current > 0 and value_api is None:
+        pos_value = raw_current
+    unrealized = pos_value - cost if cost else pos_value - pos_cost_local
+    unrealized_pct = unrealized / cost * 100 if cost else 0
+    wallet_assets = cash + pos_value
+    start_capital = _safe_float(profile().get("start_capital"), 0)
+    deposits = _safe_float(st.session_state.deposits, 0)
+    withdrawals = _safe_float(st.session_state.withdrawals, 0)
+    adjusted_profit = wallet_assets + withdrawals - deposits - start_capital if start_capital else 0
+    adjusted_roi = adjusted_profit / start_capital * 100 if start_capital else 0
+    _, _, year_pnl = period_pnl()
+    status_kind = "g" if adjusted_profit >= 0 else "b"
+    status_text = t("누적 이익 중", "Net profitable") if adjusted_profit >= 0 else t("누적 손실 중", "Net loss")
+    return {"position_value": pos_value, "position_cost": cost, "cash": cash, "wallet_assets": wallet_assets,
+            "unrealized": unrealized, "unrealized_pct": unrealized_pct,
+            "realized_pnl": raw_realized, "cash_pnl": raw_cash, "percent_pnl": raw_percent if raw_percent is not None else unrealized_pct,
+            "deposits": deposits, "withdrawals": withdrawals,
+            "adjusted_profit": adjusted_profit, "adjusted_roi": adjusted_roi,
+            "year_pnl": year_pnl, "status_kind": status_kind, "status_text": status_text,
+            "source_note": t("공개 API + 앱 입출금 보정값 기준", "Public API + app cashflow adjustments")}
+
+
+def render_profile_pnl_dashboard(pnl):
+    kind = pnl.get("status_kind", "i")
+    prof_line = st.session_state.wallet_addr[:6] + "…" + st.session_state.wallet_addr[-4:] if st.session_state.wallet_addr else t("지갑 미연결", "No wallet")
+    adj_tone = "pos" if pnl.get("adjusted_profit", 0) >= 0 else "neg"
+    un_tone = "pos" if pnl.get("unrealized", 0) >= 0 else "neg"
+    yr_tone = "pos" if pnl.get("year_pnl", 0) >= 0 else "neg"
+    html = f"""<div class='profile-hero'>
+  <div class='profile-hero-head'>
+    <div><div class='title'><span class='dot {kind}'></span>{esc(pnl.get('status_text', ''))}</div>
+    <div class='sub'>{t('Polymarket 프로필 손익 요약', 'Polymarket profile P&L summary')} · {esc(prof_line)} · {esc(pnl.get('source_note', ''))}</div></div>
+    <span class='state {kind}'>{esc(pnl.get('status_text', ''))}</span>
+  </div>
+  <div class='profile-grid'>
+    <div class='profile-cell'><div class='k'>{t('현재 포지션 가치', 'Position value')}</div><div class='v'>{money(pnl.get('position_value', 0))}</div></div>
+    <div class='profile-cell'><div class='k'>{t('지갑 총자산', 'Wallet assets')}</div><div class='v'>{money(pnl.get('wallet_assets', 0))}</div></div>
+    <div class='profile-cell'><div class='k'>{t('미실현손익', 'Unrealized P&L')}</div><div class='v {un_tone}'>{signed_money(pnl.get('unrealized', 0))}</div></div>
+    <div class='profile-cell'><div class='k'>{t('출금보정 누적손익', 'Cashflow-adjusted P&L')}</div><div class='v {adj_tone}'>{signed_money(pnl.get('adjusted_profit', 0))}</div></div>
+    <div class='profile-cell'><div class='k'>{t('보정 수익률', 'Adjusted ROI')}</div><div class='v {adj_tone}'>{signed_pct(pnl.get('adjusted_roi', 0))}</div></div>
+    <div class='profile-cell'><div class='k'>{t('올해 손익', 'Year P&L')}</div><div class='v {yr_tone}'>{signed_money(pnl.get('year_pnl', 0))}</div></div>
+    <div class='profile-cell'><div class='k'>realizedPnl</div><div class='v'>{signed_money(pnl.get('realized_pnl', 0))}</div></div>
+    <div class='profile-cell'><div class='k'>cashPnl</div><div class='v'>{signed_money(pnl.get('cash_pnl', 0))}</div></div>
+  </div>
+  <div class='sub' style='margin-top:14px;'>{t('Polymarket 프로필 화면과 소액 차이가 날 수 있습니다. 출금·입금·정산·dust 포지션은 보정값과 API 필드에 따라 달라집니다.', 'This can differ slightly from the Polymarket profile due to withdrawals, deposits, settlements and dust positions.')}</div>
+</div>"""
+    st.markdown(html, unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -813,6 +982,7 @@ def normalize_activity(raw):
             "shares": round(size, 4),
             "amount": round(amount, 2),
             "asset": str(asset),
+            "token_id": str(asset),
         })
     return rows
 
@@ -927,6 +1097,105 @@ def activity_market_table(items):
     return sorted(agg.values(), key=lambda x: (x["count"], x["amount"]), reverse=True)
 
 
+
+def _norm_key(v):
+    return "".join(ch.lower() for ch in str(v or "") if ch.isalnum())
+
+
+def _trade_ts(tr):
+    try:
+        return datetime.fromisoformat(str(tr.get("d")))
+    except Exception:
+        return datetime.min
+
+
+def link_position_to_trades(p, trades):
+    """Connect one open position to imported activity using token/asset first, then market+outcome fallback."""
+    if not trades:
+        return {"matched_trades": 0, "buy_trades": 0, "sell_trades": 0, "buy_amount": 0.0,
+                "sell_amount": 0.0, "last_trade": "", "last_buy": "", "recent_add": False,
+                "repeat_entry": False, "avg_activity_price": 0.0, "match_note": t("거래내역 없음", "No imported activity")}
+
+    pos_asset = str(p.get("asset") or p.get("token_id") or p.get("conditionId") or "").strip()
+    pos_name = _norm_key(p.get("name"))
+    pos_out = _norm_key(p.get("outcome"))
+    matched = []
+    for tr in trades:
+        tr_asset = str(tr.get("asset") or tr.get("token_id") or "").strip()
+        asset_match = pos_asset and tr_asset and pos_asset == tr_asset
+        text_match = pos_name and pos_name in _norm_key(tr.get("name")) and (not pos_out or pos_out in _norm_key(tr.get("outcome")))
+        if asset_match or text_match:
+            matched.append(tr)
+
+    matched = sorted(matched, key=_trade_ts)
+    buys = [x for x in matched if str(x.get("side", "")).upper() == "BUY"]
+    sells = [x for x in matched if str(x.get("side", "")).upper() == "SELL"]
+    buy_amount = sum(_safe_float(x.get("amount"), 0) for x in buys)
+    sell_amount = sum(_safe_float(x.get("amount"), 0) for x in sells)
+    buy_shares = sum(_safe_float(x.get("shares"), 0) for x in buys)
+    avg_px = (buy_amount / buy_shares * 100) if buy_shares else 0
+    last_trade = matched[-1]["d"][:16] if matched else ""
+    last_buy_dt = _trade_ts(buys[-1]) if buys else None
+    recent_add = bool(last_buy_dt and (datetime.now() - last_buy_dt).total_seconds() <= 60 * 60 * 24)
+    repeat_entry = len(buys) >= 3
+    note = t(f"연결 거래 {len(matched)}건 · 매수 {len(buys)}회 / 매도 {len(sells)}회",
+             f"Linked {len(matched)} fills · {len(buys)} buys / {len(sells)} sells")
+    if recent_add:
+        note += t(" · 최근 24시간 추가매수", " · added in last 24h")
+    if repeat_entry:
+        note += t(" · 반복 진입 주의", " · repeated entry")
+    return {"matched_trades": len(matched), "buy_trades": len(buys), "sell_trades": len(sells),
+            "buy_amount": buy_amount, "sell_amount": sell_amount, "last_trade": last_trade,
+            "last_buy": last_buy_dt.isoformat()[:16] if last_buy_dt else "", "recent_add": recent_add,
+            "repeat_entry": repeat_entry, "avg_activity_price": avg_px, "match_note": note}
+
+
+def habit_report(trades):
+    """Higher-level trading habit report from imported activity. It does not calculate realized P&L."""
+    sm = summarize_activity(trades)
+    insights = list(sm.get("insights", []))
+    if not trades:
+        return {**sm, "habit_level": "i", "habit_title": t("거래 습관 데이터 없음", "No habit data"), "habit_insights": insights}
+
+    by_day = {}
+    last_by_market = {}
+    fast_reentries = 0
+    chase_like = 0
+    for tr in sorted(trades, key=_trade_ts):
+        dkey = str(tr.get("d") or "")[:10]
+        by_day[dkey] = by_day.get(dkey, 0) + 1
+        name = str(tr.get("name") or "Unknown")
+        side = str(tr.get("side") or "").upper()
+        dt = _trade_ts(tr)
+        px = _safe_float(tr.get("price"), 0)
+        if side == "BUY" and px >= 80:
+            chase_like += 1
+        prev = last_by_market.get(name)
+        if prev and side == "BUY" and prev.get("side") == "BUY":
+            gap_min = (dt - prev.get("dt", dt)).total_seconds() / 60
+            if 0 <= gap_min <= 180:
+                fast_reentries += 1
+        last_by_market[name] = {"dt": dt, "side": side}
+
+    max_day = max(by_day.values()) if by_day else 0
+    if max_day >= 15 or fast_reentries >= 3:
+        level, title = "b", t("과열 거래 가능성 높음", "High chance of overtrading")
+    elif max_day >= 8 or fast_reentries >= 1 or chase_like >= 2:
+        level, title = "w", t("거래 습관 주의", "Trading habit caution")
+    else:
+        level, title = "g", t("거래 빈도 관리 가능", "Trading frequency manageable")
+
+    insights.append((level, t(f"최대 하루 거래 {max_day}건 · 빠른 재진입 {fast_reentries}회 · 80¢ 이상 매수 {chase_like}회",
+                              f"Max daily trades {max_day} · fast re-entries {fast_reentries} · buys above 80¢ {chase_like}")))
+    if fast_reentries:
+        insights.append(("w", t("짧은 시간 안의 같은 시장 재매수가 감지됐습니다. 손실 복구/추격매수인지 복기하세요.",
+                                "Repeated buys in the same market within a short time were detected. Review whether it was chasing or loss recovery.")))
+    if chase_like:
+        insights.append(("w", t("80¢ 이상 고가 매수가 있습니다. 작은 추가수익을 위해 큰 금액을 위험에 둔 거래인지 확인하세요.",
+                                "Some buys were above 80¢. Check whether you risked too much for limited upside.")))
+    return {**sm, "habit_level": level, "habit_title": title, "habit_insights": insights}
+
+
 def portfolio_card_html(ar):
     pnl_cls = "pos" if ar.get("pnl", 0) >= 0 else "neg"
     return f'''<div class="pf-card">
@@ -944,8 +1213,10 @@ def portfolio_card_html(ar):
     <div class="pf-metric"><div class="k">{t("비중", "Weight")}</div><div class="v">{ar.get("pct", 0):.1f}%</div></div>
     <div class="pf-metric"><div class="k">{t("현재가", "Now")}</div><div class="v">{ar.get("cur", 0):.1f}¢</div></div>
     <div class="pf-metric"><div class="k">{t("평균가", "Avg")}</div><div class="v">{ar.get("buy", 0):.1f}¢</div></div>
+    <div class="pf-metric"><div class="k">{t("연결 거래", "Linked")}</div><div class="v">{int(ar.get("matched_trades", 0))}건</div></div>
+    <div class="pf-metric"><div class="k">{t("매수 횟수", "Buys")}</div><div class="v">{int(ar.get("buy_trades", 0))}회</div></div>
   </div>
-  <div class="pf-note">{esc(ar.get("summary"))}</div>
+  <div class="pf-note">{esc(ar.get("summary"))}<br><b>{t("거래 연결", "Trade link")}:</b> {esc(ar.get("match_note", t("자동 거래내역 없음", "No imported activity")))}</div>
 </div>'''
 
 
@@ -1437,16 +1708,16 @@ with tab1:
                         duplicate_ml=duplicate_ml, duplicate_game=duplicate_game,
                         duplicate_side=duplicate_side, fomo_count=fomo_count)
             st.session_state.last_entry = calculate_entry(data)
-            prompt = build_prompt(team_a, team_b, league, current_price, fair_price, purpose)
+            prompt = build_prompt(team_a, team_b, league, current_price, fair_price, purpose, market_type, market_name)
             st.session_state.ai_prompt = prompt
-            st.session_state.ai_pair = f"{team_a} vs {team_b}"
-            with st.spinner(t("Claude가 팀을 분석하고 있습니다", "Claude is analyzing")):
+            st.session_state.ai_pair = f"{market_name} · {market_type}"
+            with st.spinner(t("Claude가 시장을 분석하고 있습니다", "Claude is analyzing the market")):
                 text, err = call_claude(prompt)
             st.session_state.ai_text = text or ""
             st.session_state.ai_error = err or ""
             st.rerun()
 
-        st.markdown(f'<div class="eyebrow" style="margin-top:26px;">{t("Claude 팀 분석", "Claude team analysis")}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="eyebrow" style="margin-top:26px;">{t("Claude 시장 분석", "Claude market analysis")}</div>', unsafe_allow_html=True)
         if st.session_state.ai_text:
             st.markdown(f'<div class="footnote" style="margin-bottom:4px;">{st.session_state.ai_pair}</div>', unsafe_allow_html=True)
             render_ai(st.session_state.ai_text)
@@ -1579,7 +1850,7 @@ with tab4:
                     st.markdown(line(t(f"거래내역 불러오기 실패 — {e}", f"Activity import failed — {e}"), "b"), unsafe_allow_html=True)
 
         if st.session_state.auto_trades:
-            sm = summarize_activity(st.session_state.auto_trades)
+            sm = habit_report(st.session_state.auto_trades)
             st.markdown(f'<div class="eyebrow" style="margin-top:16px;">{t("자동 거래 요약", "Auto trade summary")}</div>', unsafe_allow_html=True)
             st.markdown(
                 '<div class="trade-grid">'
@@ -1589,8 +1860,13 @@ with tab4:
                 f'<div class="trade-card"><div class="k">{t("총 거래금액", "Turnover")}</div><div class="v">{money(sm["total_amount"])}</div></div>'
                 '</div>', unsafe_allow_html=True)
 
-            st.markdown(f'<div class="eyebrow">{t("거래 패턴 분석", "Trade pattern analysis")}</div>', unsafe_allow_html=True)
-            st.markdown(''.join(f'<div class="trade-insight"><span class="dot {kk}"></span>{esc(txt)}</div>' for kk, txt in sm["insights"]), unsafe_allow_html=True)
+            st.markdown(f'<div class="eyebrow">{t("거래습관 리포트", "Trading habit report")}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="verdict" style="padding:12px 0 10px 0;border-top:none;">'
+                f'<div class="v-title" style="font-size:28px;"><span class="dot {sm.get("habit_level", "i")}"></span>{esc(sm.get("habit_title", ""))}</div>'
+                f'<div class="v-sub">{t("자동 거래내역 기준의 행동 패턴 요약입니다. 실현손익 계산에는 아직 합산하지 않습니다.", "Behavior-pattern summary from imported activity. It is not yet merged into realized P&L.")}</div></div>',
+                unsafe_allow_html=True)
+            st.markdown(''.join(f'<div class="trade-insight"><span class="dot {kk}"></span>{esc(txt)}</div>' for kk, txt in sm.get("habit_insights", [])), unsafe_allow_html=True)
 
             market_rows = activity_market_table(st.session_state.auto_trades)
             if market_rows:
@@ -1734,6 +2010,10 @@ with tab_pf:
                     with st.spinner(t("폴리마켓에서 불러오는 중", "Fetching")):
                         items = fetch_wallet_positions(a)
                     st.session_state.wallet_raw = items
+                    try:
+                        st.session_state.pnl_raw = fetch_wallet_value(a)
+                    except Exception as _pnl_err:
+                        st.session_state.pnl_raw = {"error": str(_pnl_err)}
                     open_items = [it for it in items if is_open_position(it)] if isinstance(items, list) else []
                     st.session_state.portfolio = [dict(
                         name=it.get("title") or "Polymarket position",
@@ -1742,6 +2022,7 @@ with tab_pf:
                         shares=round(_safe_float(it.get("size"), 0), 2),
                         inv=round(_safe_float(it.get("initialValue"), 0), 2),
                         cur=round(_safe_float(it.get("curPrice"), 0) * 100, 1),
+                        asset=str(it.get("asset") or it.get("tokenId") or it.get("clobTokenId") or it.get("conditionId") or ""),
                     ) for it in open_items]
                     st.toast(t(f"현재 보유 포지션 {len(open_items)}개", f"{len(open_items)} open positions"))
                     st.rerun()
@@ -1754,6 +2035,13 @@ with tab_pf:
 
     with st.expander(t("디버그 — positions raw 응답", "Debug — raw positions response")):
         st.json(st.session_state.wallet_raw)
+    with st.expander(t("디버그 — profile/value raw 응답", "Debug — profile/value raw response")):
+        st.json(st.session_state.pnl_raw)
+
+    # ---- profile-like P&L summary ----
+    cash_preview = _safe_float(st.session_state.cash, 0)
+    st.session_state.profile_pnl = calc_profile_pnl(st.session_state.portfolio, cash_preview, st.session_state.wallet_raw, st.session_state.pnl_raw)
+    render_profile_pnl_dashboard(st.session_state.profile_pnl)
 
     # ---- open positions first ----
     cash = st.number_input(t("현금 잔고 (USDC, $)", "Cash balance (USDC, $)"), 0.0, value=float(st.session_state.cash), key="cash_input")
@@ -1768,6 +2056,7 @@ with tab_pf:
         cards = []
         for p in st.session_state.portfolio:
             ar = analyze_portfolio_position(p, bankroll_for_positions)
+            ar.update(link_position_to_trades(p, st.session_state.auto_trades))
             cards.append(portfolio_card_html(ar))
         st.markdown('<div class="pf-grid">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="footnote">{t("카드는 현재가·평균가·수량·투자금만으로 자동 판단합니다. 아래 편집표에서 값을 고치면 즉시 다시 계산됩니다.", "Cards use price, average, shares and cost only. Edit the table below to recalculate instantly.")}</div>', unsafe_allow_html=True)
@@ -1781,6 +2070,7 @@ with tab_pf:
                 "shares": st.column_config.NumberColumn(t("수량", "Shares"), format="%.2f"),
                 "inv": st.column_config.NumberColumn(t("투자금 ($)", "Cost ($)"), format="%.2f"),
                 "cur": st.column_config.NumberColumn(t("현재가 (¢)", "Now (¢)"), format="%.1f"),
+                "asset": st.column_config.TextColumn(t("토큰/자산 ID", "Token/asset ID")),
             }
             edited = st.data_editor(df, column_config=col_cfg, use_container_width=True,
                                     hide_index=True, num_rows="dynamic", key="pf_editor")
@@ -1813,14 +2103,15 @@ with tab_pf:
                 shares_v = np_shares if np_shares > 0 else (np_inv / (np_buy / 100) if np_buy > 0 else 0)
                 inv_v = np_inv if np_inv > 0 else shares_v * (np_buy / 100)
                 st.session_state.portfolio.append(dict(name=np_name, outcome=np_out, buy=np_buy,
-                                                       shares=round(shares_v, 2), inv=round(inv_v, 2), cur=np_cur))
+                                                       shares=round(shares_v, 2), inv=round(inv_v, 2), cur=np_cur, asset=""))
                 st.rerun()
 
     st.markdown(f'<div class="eyebrow" style="margin-top:24px;">{t("포지션별 핵심 판단", "Per-position key verdicts")}</div>', unsafe_allow_html=True)
     if st.session_state.portfolio:
         for p in st.session_state.portfolio:
             ar = analyze_portfolio_position(p, bankroll_for_positions)
-            st.markdown(line(f'<b>{esc(ar["name"])}</b> — {esc(ar["title"])} · {esc(ar["summary"])}', ar["kind"]), unsafe_allow_html=True)
+            ar.update(link_position_to_trades(p, st.session_state.auto_trades))
+            st.markdown(line(f'<b>{esc(ar["name"])}</b> — {esc(ar["title"])} · {esc(ar["summary"])} · {esc(ar.get("match_note", ""))}', ar["kind"]), unsafe_allow_html=True)
     else:
         st.markdown(f'<div class="footnote">{t("보유 포지션을 불러오면 각 배팅별 판단이 여기에 표시됩니다.", "Import holdings to see a verdict for each bet here.")}</div>', unsafe_allow_html=True)
 
@@ -1982,6 +2273,7 @@ with tab_set:
                   "portfolio": st.session_state.portfolio, "trade_log": st.session_state.trade_log,
                   "auto_trades": st.session_state.auto_trades, "wallet_addr": st.session_state.wallet_addr,
                   "imported_tx_ids": st.session_state.imported_tx_ids,
+                  "pnl_raw": st.session_state.pnl_raw, "profile_pnl": st.session_state.profile_pnl,
                   "adj_month": st.session_state.adj_month, "adj_year": st.session_state.adj_year,
                   "reviews": st.session_state.reviews}
         st.download_button(t("백업 내려받기 (JSON)", "Download backup (JSON)"),
@@ -2001,6 +2293,8 @@ with tab_set:
                 st.session_state.auto_trades = data.get("auto_trades", [])
                 st.session_state.wallet_addr = data.get("wallet_addr", "")
                 st.session_state.imported_tx_ids = data.get("imported_tx_ids", [])
+                st.session_state.pnl_raw = data.get("pnl_raw", {})
+                st.session_state.profile_pnl = data.get("profile_pnl", {})
                 st.session_state.adj_month = float(data.get("adj_month", 0))
                 st.session_state.adj_year = float(data.get("adj_year", 0))
                 st.session_state.reviews = data.get("reviews", [])
