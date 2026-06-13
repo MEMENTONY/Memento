@@ -283,6 +283,7 @@ DEFAULTS = {
     "entry_raw": {},
     "ai_extra_context": "",
     "_entry_active": "",
+    "_entry_sel": None,
     "explore_ai_text": "", "explore_ai_error": "", "explore_ai_prompt": "", "explore_ai_pair": "",
     "ai_text": "", "ai_error": "", "ai_prompt": "", "ai_pair": "",
     "wallet_raw": [],
@@ -950,21 +951,16 @@ PROP_KW = (
     "first blood", "first tower", "first dragon", "first baron", "kills", "towers",
     "tower", "dragon", "baron", "handicap", "spread", "total", "over/under", "o/u",
     "correct score", "map score", "series score", "exact score", "duration",
-    "objectives", "inhibitor", "first to", "player props"
+    "objectives", "inhibitor", "first to", "player props",
 )
 MAIN_KW = (
     "moneyline", "match winner", "match-winner", "series winner", "series-winner",
-    "overall winner", "event winner", "to win", "will win", "match result", "series result"
+    "overall winner", "event winner", "to win", "will win", "match result", "series result",
 )
 
 
 def classify_market_type(question, outcome="", is_binary=False):
-    """Classify URL-loaded Polymarket markets.
-
-    핵심: Polymarket은 전체승리/머니라인에 moneyline이라는 단어가 없을 때가 있다.
-    그래서 prop/game이 아닌 2선택지 팀-vs-팀 시장은 MAIN으로 승격한다.
-    """
-    s = f"{question or ''} {outcome or ''}".lower()
+    s = f"{question} {outcome}".lower()
     if any(k in s for k in PROP_KW):
         return "prop"
     if GAME_RE.search(s):
@@ -984,6 +980,57 @@ def is_relevant_market(q, outcome="", event_title=""):
     s = f"{event_title or ''} {q or ''}"
     return classify_market_type(s, outcome, False) in ("p1_main", "p2_game")
 
+
+def extract_markets(payload, category=""):
+    events = payload if isinstance(payload, list) else payload.get("events", [])
+    if not isinstance(events, list):
+        return []
+    p1, p2, binary_other = [], [], []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_title = event.get("title") or event.get("ticker") or event.get("slug") or ""
+        for m in event.get("markets", []) or []:
+            if not isinstance(m, dict):
+                continue
+            q = m.get("question") or m.get("title") or m.get("slug") or "Unknown"
+            full_q = f"{event_title} {q}"
+            outs = parse_list(m.get("outcomes"))
+            prices = parse_list(m.get("outcomePrices"))
+            tokens = parse_list(m.get("clobTokenIds"))
+            if not outs:
+                continue
+            is_bin = len(outs) == 2
+            cls = classify_market_type(full_q, "", is_bin)
+            if cls == "prop":
+                continue
+            for i, o in enumerate(outs):
+                price = None
+                if i < len(prices):
+                    try:
+                        price = round(float(prices[i]) * 100, 2)
+                    except Exception:
+                        price = None
+                row = {
+                    t("시장", "Market"): q,
+                    t("선택지", "Outcome"): o,
+                    t("현재가 (¢)", "Price (¢)"): price,
+                    "token_id": tokens[i] if i < len(tokens) else "",
+                    "market_class": cls,
+                    "_binary": is_bin,
+                    "event_title": event_title,
+                }
+                if cls == "p1_main":
+                    p1.append(row)
+                elif cls == "p2_game":
+                    p2.append(row)
+                elif is_bin:
+                    binary_other.append(row)
+    if not p1 and binary_other:
+        for r in binary_other:
+            r["market_class"] = "p1_main"
+        p1 = binary_other
+    return p1 + p2
 
 def _event_resolution(event, market):
     return (market.get("rules") or market.get("description") or market.get("resolutionSource") or event.get("rules") or event.get("description") or event.get("resolutionSource") or "")
@@ -2393,7 +2440,7 @@ def _analyze_row_inline(idx, m, entry_category, entry_subcategory, is_game=False
             st.rerun()
 
     if st.session_state.get("_entry_active") == f"{idx}_{keytok}" and st.session_state.get("last_entry"):
-        with st.expander(t("입력 조정 / AI 메모", "Adjust inputs / AI memo"), expanded=False):
+        with st.expander(t("입력 조정 / AI 메모", "Adjust inputs / AI memo"), expanded=True):
             with st.form(f"adjust_{idx}_{keytok}"):
                 a1, a2, a3, a4 = st.columns(4)
                 with a1:
@@ -2404,6 +2451,11 @@ def _analyze_row_inline(idx, m, entry_category, entry_subcategory, is_game=False
                     conf_i = st.selectbox(t("확신", "Conviction"), confidence_options(), index=2, key=f"adj_cf_{idx}_{keytok}")
                 with a4:
                     purpose_i = st.selectbox(t("목적", "Purpose"), purpose_options(), index=0, key=f"adj_pp_{idx}_{keytok}")
+                bookmaker_memo_i = st.text_input(
+                    t("외부배당 출처 메모", "Bookmaker/source memo"),
+                    key=f"adj_bm_{idx}_{keytok}",
+                    placeholder=t("예: Pinnacle T1 -180, Bet365 Gen.G 1.55", "e.g. Pinnacle T1 -180, Bet365 Gen.G 1.55"),
+                )
                 ai_ctx = st.text_area(
                     t("AI 리서치 메모 / 외부정보", "AI research memo / external info"),
                     key=f"adj_ax_{idx}_{keytok}",
@@ -2429,7 +2481,7 @@ def _analyze_row_inline(idx, m, entry_category, entry_subcategory, is_game=False
                         entry_category,
                         entry_subcategory,
                         ai_context=ai_ctx,
-                        adv={"target_price": target_i, "stop_price": stop_i, "fomo_count": fomo_i, "market_type": "Match Moneyline"},
+                        adv={"target_price": target_i, "stop_price": stop_i, "fomo_count": fomo_i, "market_type": "Match Moneyline", "bookmaker_source_memo": bookmaker_memo_i},
                     )
                 st.session_state["_entry_active"] = f"{idx}_{keytok}"
                 st.rerun()
@@ -2962,6 +3014,7 @@ with tab_pf:
             st.session_state.adj_year = st.number_input(t("올해 보정 ($)", "This-year adjustment ($)"), value=float(st.session_state.adj_year))
 
     w, m, y = period_pnl()
+    sc = (profile().get("start_capital", 0) or profile().get("assets", 0) or 0)
     def pct_of_start(v):
         return signed_pct(v / sc * 100) if sc else "—"
     st.markdown(
