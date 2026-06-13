@@ -279,6 +279,7 @@ DEFAULTS = {
     "habit_cache": {},
     "pnl_raw": {},
     "profile_pnl": {},
+    "dev_mode": False,
     "reviews": [],
 }
 for k, v in DEFAULTS.items():
@@ -1170,21 +1171,22 @@ def calc_profile_pnl(portfolio, cash, raw_positions=None, raw_value=None):
     unrealized = pos_value - cost if cost else pos_value - pos_cost_local
     unrealized_pct = unrealized / cost * 100 if cost else 0
     wallet_assets = cash + pos_value
-    start_capital = _safe_float(profile().get("start_capital"), 0)
     deposits = _safe_float(st.session_state.deposits, 0)
     withdrawals = _safe_float(st.session_state.withdrawals, 0)
-    adjusted_profit = wallet_assets + withdrawals - deposits - start_capital if start_capital else 0
-    adjusted_roi = adjusted_profit / start_capital * 100 if start_capital else 0
-    _, _, year_pnl = period_pnl()
-    status_kind = "g" if adjusted_profit >= 0 else "b"
-    status_text = t("누적 이익 중", "Net profitable") if adjusted_profit >= 0 else t("누적 손실 중", "Net loss")
+    # Manual cash/deposit/withdrawal inputs are the source of truth for profile-like P&L.
+    # Deposit and withdrawal are both entered as positive total amounts.
+    net_profit = wallet_assets + withdrawals - deposits
+    adjusted_roi = net_profit / deposits * 100 if deposits else None
+    _, month_pnl, year_pnl = period_pnl()
+    status_kind = "g" if net_profit >= 0 else "b"
+    status_text = t("누적 이익 중", "Net profitable") if net_profit >= 0 else t("누적 손실 중", "Net loss")
     return {"position_value": pos_value, "position_cost": cost, "cash": cash, "wallet_assets": wallet_assets,
             "unrealized": unrealized, "unrealized_pct": unrealized_pct,
             "realized_pnl": raw_realized, "cash_pnl": raw_cash, "percent_pnl": raw_percent if raw_percent is not None else unrealized_pct,
             "deposits": deposits, "withdrawals": withdrawals,
-            "adjusted_profit": adjusted_profit, "adjusted_roi": adjusted_roi,
-            "year_pnl": year_pnl, "status_kind": status_kind, "status_text": status_text,
-            "source_note": t("공개 API + 앱 입출금 보정값 기준", "Public API + app cashflow adjustments")}
+            "adjusted_profit": net_profit, "net_profit": net_profit, "adjusted_roi": adjusted_roi,
+            "month_pnl": month_pnl, "year_pnl": year_pnl, "status_kind": status_kind, "status_text": status_text,
+            "source_note": t("수동 현금·입금·출금 + 공개 포지션 API 기준", "Manual cash/deposit/withdrawal + public position API")}
 
 
 def render_profile_pnl_dashboard(pnl):
@@ -1193,6 +1195,8 @@ def render_profile_pnl_dashboard(pnl):
     adj_tone = "pos" if pnl.get("adjusted_profit", 0) >= 0 else "neg"
     un_tone = "pos" if pnl.get("unrealized", 0) >= 0 else "neg"
     yr_tone = "pos" if pnl.get("year_pnl", 0) >= 0 else "neg"
+    roi_val = pnl.get("adjusted_roi")
+    roi_text = signed_pct(roi_val) if roi_val is not None else "—"
     html = f"""<div class='profile-hero'>
   <div class='profile-hero-head'>
     <div><div class='title'><span class='dot {kind}'></span>{esc(pnl.get('status_text', ''))}</div>
@@ -1204,7 +1208,7 @@ def render_profile_pnl_dashboard(pnl):
     <div class='profile-cell'><div class='k'>{t('지갑 총자산', 'Wallet assets')}</div><div class='v'>{money(pnl.get('wallet_assets', 0))}</div></div>
     <div class='profile-cell'><div class='k'>{t('미실현손익', 'Unrealized P&L')}</div><div class='v {un_tone}'>{signed_money(pnl.get('unrealized', 0))}</div></div>
     <div class='profile-cell'><div class='k'>{t('출금보정 누적손익', 'Cashflow-adjusted P&L')}</div><div class='v {adj_tone}'>{signed_money(pnl.get('adjusted_profit', 0))}</div></div>
-    <div class='profile-cell'><div class='k'>{t('보정 수익률', 'Adjusted ROI')}</div><div class='v {adj_tone}'>{signed_pct(pnl.get('adjusted_roi', 0))}</div></div>
+    <div class='profile-cell'><div class='k'>{t('보정 수익률', 'Adjusted ROI')}</div><div class='v {adj_tone}'>{roi_text}</div></div>
     <div class='profile-cell'><div class='k'>{t('올해 손익', 'Year P&L')}</div><div class='v {yr_tone}'>{signed_money(pnl.get('year_pnl', 0))}</div></div>
     <div class='profile-cell'><div class='k'>realizedPnl</div><div class='v'>{signed_money(pnl.get('realized_pnl', 0))}</div></div>
     <div class='profile-cell'><div class='k'>cashPnl</div><div class='v'>{signed_money(pnl.get('cash_pnl', 0))}</div></div>
@@ -2135,10 +2139,11 @@ with tab_explore:
                 with b4:
                     st.link_button(t("원본 열기", "Open original"), url or "https://polymarket.com", use_container_width=True)
 
-            with st.expander(t("원본 시장 데이터", "Raw market data")):
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                st.json(st.session_state.explore_raw)
-                st.caption(t("CLOB book/history는 카드별로 캐시 호출됩니다. 실패 시 카드에서 — 로 표시됩니다.", "CLOB book/history is fetched per card with cache. Failures show as —."))
+            if st.session_state.get("dev_mode", False):
+                with st.expander(t("원본 시장 데이터", "Raw market data")):
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    st.json(st.session_state.explore_raw)
+                    st.caption(t("CLOB book/history는 카드별로 캐시 호출됩니다. 실패 시 카드에서 — 로 표시됩니다.", "CLOB book/history is fetched per card with cache. Failures show as —."))
 
     with ex_right:
         st.markdown(f'<div class="eyebrow">{t("AI 시장 보고서", "AI market report")}</div>', unsafe_allow_html=True)
@@ -2337,8 +2342,9 @@ with tab4:
         else:
             st.markdown(f'<div class="footnote">{t("거래내역을 불러오면 자동 요약과 패턴 분석이 여기에 표시됩니다.", "Import activity to see automatic summaries and pattern analysis here.")}</div>', unsafe_allow_html=True)
 
-        with st.expander(t("디버그 — activity raw 응답", "Debug — raw activity response")):
-            st.json(st.session_state.activity_raw)
+        if st.session_state.get("dev_mode", False):
+            with st.expander(t("디버그 — activity raw 응답", "Debug — raw activity response")):
+                st.json(st.session_state.activity_raw)
 
     with st.form("trade_form"):
         t1c, t2c, t3c = st.columns(3)
@@ -2466,21 +2472,31 @@ with tab_pf:
                 except Exception as e:
                     st.markdown(line(t(f"불러오기 실패 — {e}", f"Import failed — {e}"), "b"), unsafe_allow_html=True)
 
-    with st.expander(t("디버그 — positions raw 응답", "Debug — raw positions response")):
-        st.json(st.session_state.wallet_raw)
-    with st.expander(t("디버그 — profile/value raw 응답", "Debug — profile/value raw response")):
-        st.json(st.session_state.pnl_raw)
+    if st.session_state.get("dev_mode", False):
+        with st.expander(t("디버그 — positions raw 응답", "Debug — raw positions response")):
+            st.json(st.session_state.wallet_raw)
+        with st.expander(t("디버그 — profile/value raw 응답", "Debug — profile/value raw response")):
+            st.json(st.session_state.pnl_raw)
 
-    # ---- profile-like P&L summary ----
-    cash_preview = _safe_float(st.session_state.cash, 0)
-    st.session_state.profile_pnl = calc_profile_pnl(st.session_state.portfolio, cash_preview, st.session_state.wallet_raw, st.session_state.pnl_raw)
+    # ---- profile-like P&L summary: manual cash/deposit/withdrawal is the source of truth ----
+    pos_value = sum((p.get("shares", 0) or 0) * ((p.get("cur", 0) or 0) / 100) for p in st.session_state.portfolio)
+    pos_cost = sum((p.get("inv", 0) or 0) for p in st.session_state.portfolio)
+
+    st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("프로필 보정값", "Profile adjustments")}</div>', unsafe_allow_html=True)
+    pf_i1, pf_i2, pf_i3 = st.columns(3)
+    with pf_i1:
+        st.session_state.cash = st.number_input(t("현금 보유량 (USDC, $)", "Cash balance (USDC, $)"), 0.0, value=float(st.session_state.cash), key="cash_input")
+    with pf_i2:
+        st.session_state.deposits = st.number_input(t("총 입금액 ($)", "Total deposits ($)"), 0.0, value=float(st.session_state.deposits), key="deposit_input")
+    with pf_i3:
+        st.session_state.withdrawals = st.number_input(t("총 출금액 ($)", "Total withdrawals ($)"), 0.0, value=float(st.session_state.withdrawals), key="withdrawal_input")
+    st.markdown(f'<div class="footnote" style="margin-top:-8px;">{t("현금은 수동 입력값이 기준입니다. 총 입금액은 양수, 총 출금액도 양수로 입력하세요.", "Manual cash is the source of truth. Enter both total deposits and total withdrawals as positive values.")}</div>', unsafe_allow_html=True)
+
+    st.session_state.profile_pnl = calc_profile_pnl(st.session_state.portfolio, st.session_state.cash, st.session_state.wallet_raw, st.session_state.pnl_raw)
     render_profile_pnl_dashboard(st.session_state.profile_pnl)
 
     # ---- open positions first ----
-    cash = st.number_input(t("현금 잔고 (USDC, $)", "Cash balance (USDC, $)"), 0.0, value=float(st.session_state.cash), key="cash_input")
-    st.session_state.cash = cash
-    pos_value = sum((p.get("shares", 0) or 0) * ((p.get("cur", 0) or 0) / 100) for p in st.session_state.portfolio)
-    pos_cost = sum((p.get("inv", 0) or 0) for p in st.session_state.portfolio)
+    cash = float(st.session_state.cash)
     total_assets = cash + pos_value
     bankroll_for_positions = total_assets if total_assets > 0 else prof["assets"]
 
@@ -2549,14 +2565,6 @@ with tab_pf:
         st.markdown(f'<div class="footnote">{t("보유 포지션을 불러오면 각 배팅별 판단이 여기에 표시됩니다.", "Import holdings to see a verdict for each bet here.")}</div>', unsafe_allow_html=True)
 
     # ---- total assets after position analysis ----
-    with st.expander(t("입출금 보정", "Deposit / withdrawal adjustment")):
-        st.markdown(f'<div class="footnote" style="margin:0 0 10px 0;">{t("출금하면 지갑 자산은 줄어도 실제 번 돈은 사라진 게 아닙니다. 시작 자금 이후 추가 입금/출금을 넣으면 보정 후 실제 성과를 계산합니다.", "Withdrawals lower wallet assets, but not real profit. Enter deposits/withdrawals after the starting capital to calculate adjusted performance.")}</div>', unsafe_allow_html=True)
-        cf1, cf2 = st.columns(2)
-        with cf1:
-            st.session_state.deposits = st.number_input(t("시작 이후 추가 입금 총액 ($)", "Extra deposits after start ($)"), 0.0, value=float(st.session_state.deposits))
-        with cf2:
-            st.session_state.withdrawals = st.number_input(t("시작 이후 출금 총액 ($)", "Withdrawals after start ($)"), 0.0, value=float(st.session_state.withdrawals))
-
     pos_value = sum((p.get("shares", 0) or 0) * ((p.get("cur", 0) or 0) / 100) for p in st.session_state.portfolio)
     pos_cost = sum((p.get("inv", 0) or 0) for p in st.session_state.portfolio)
     unrealized = pos_value - pos_cost
@@ -2568,9 +2576,10 @@ with tab_pf:
     total_roi = total_pnl / sc * 100 if sc else 0
     deposits = st.session_state.deposits
     withdrawals = st.session_state.withdrawals
-    flow_adjusted_pnl = total_assets + withdrawals - deposits - sc
-    flow_adjusted_roi = flow_adjusted_pnl / sc * 100 if sc else 0
-    wallet_gap = flow_adjusted_pnl - (total_assets - sc)
+    flow_adjusted_pnl = total_assets + withdrawals - deposits
+    flow_adjusted_roi = flow_adjusted_pnl / deposits * 100 if deposits else None
+    flow_adjusted_roi_text = signed_pct(flow_adjusted_roi) if flow_adjusted_roi is not None else "—"
+    wallet_gap = withdrawals - deposits
 
     st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("자산 요약", "Asset summary")}</div>', unsafe_allow_html=True)
     st.markdown(
@@ -2584,7 +2593,7 @@ with tab_pf:
         + stat(t("앱 기록 실현손익", "App-recorded realized"), signed_money(realized_total), t("거래일지 + 올해 보정", "Journal + yearly adjustment"), "pos" if realized_total >= 0 else "neg")
         + stat(t("총 손익", "Total P&L"), signed_money(total_pnl), signed_pct(total_roi), "pos" if total_pnl >= 0 else "neg")
         + stat(t("입출금 보정 실제손익", "Flow-adjusted P&L"), signed_money(flow_adjusted_pnl), t(f"출금 {money(withdrawals)} · 추가입금 {money(deposits)}", f"Withdrawn {money(withdrawals)} · deposited {money(deposits)}"), "pos" if flow_adjusted_pnl >= 0 else "neg")
-        + stat(t("보정 후 수익률", "Adjusted ROI"), signed_pct(flow_adjusted_roi), t(f"시작 {money(sc)} 기준", f"vs start {money(sc)}"), "pos" if flow_adjusted_roi >= 0 else "neg")
+        + stat(t("보정 후 수익률", "Adjusted ROI"), flow_adjusted_roi_text, t("총 입금액 기준", "vs total deposits"), "pos" if flow_adjusted_pnl >= 0 else "neg")
         + "</div>", unsafe_allow_html=True)
 
     ph = portfolio_health(st.session_state.portfolio, cash)
@@ -2640,6 +2649,16 @@ with tab_set:
         else:
             st.markdown(line(t("Claude API 연결 성공", "Claude API connection successful"), "g"), unsafe_allow_html=True)
             st.caption(test_text)
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # ---- developer mode ----
+    st.markdown(f'<div class="eyebrow">{t("개발자 모드", "Developer mode")}</div>', unsafe_allow_html=True)
+    st.session_state.dev_mode = st.checkbox(
+        t("디버그/Raw API 응답 보기", "Show debug / raw API responses"),
+        value=bool(st.session_state.get("dev_mode", False)),
+        help=t("일반 사용 시 꺼두면 포트폴리오와 거래내역 화면이 더 깔끔해집니다.", "Keep this off for a cleaner portfolio and journal UI."),
+    )
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
@@ -2710,6 +2729,7 @@ with tab_set:
                   "pnl_raw": st.session_state.pnl_raw, "profile_pnl": st.session_state.profile_pnl,
                   "explore_url": st.session_state.explore_url, "explore_markets": st.session_state.explore_markets,
                   "prefill_entry": st.session_state.prefill_entry,
+                  "dev_mode": st.session_state.dev_mode,
                   "adj_month": st.session_state.adj_month, "adj_year": st.session_state.adj_year,
                   "reviews": st.session_state.reviews}
         st.download_button(t("백업 내려받기 (JSON)", "Download backup (JSON)"),
@@ -2724,6 +2744,7 @@ with tab_set:
                 st.session_state.cash = float(data.get("cash", 0))
                 st.session_state.deposits = float(data.get("deposits", 0))
                 st.session_state.withdrawals = float(data.get("withdrawals", 0))
+                st.session_state.dev_mode = bool(data.get("dev_mode", False))
                 st.session_state.portfolio = data.get("portfolio", [])
                 st.session_state.trade_log = data.get("trade_log", [])
                 st.session_state.auto_trades = data.get("auto_trades", [])
