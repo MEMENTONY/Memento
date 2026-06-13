@@ -856,6 +856,25 @@ def parse_list(v):
         except Exception: return []
     return []
 
+
+ALLOWED_MARKET_KW = (
+    "match winner", "match-winner", "series winner", "series-winner",
+    "overall winner", "overall-winner", "game winner", "game-winner",
+    "to win", "winner", "win the match", "win this match", "win the series"
+)
+
+
+def is_relevant_market(question, outcome=""):
+    """Market Explorer: keep only single-match/series/overall winner style markets."""
+    s = f"{question or ''} {outcome or ''}".lower()
+    if not s.strip():
+        return False
+    # Keep broad winner markets, but avoid obviously unrelated prop/correct-score/handicap/totals markets.
+    blocked = ("correct score", "map handicap", "spread", "total maps", "total games", "over/under", "first blood", "first map", "round ")
+    if any(b in s for b in blocked):
+        return False
+    return any(k in s for k in ALLOWED_MARKET_KW)
+
 def extract_markets(payload):
     events = payload if isinstance(payload, list) else payload.get("events", [])
     rows = []
@@ -864,6 +883,8 @@ def extract_markets(payload):
             q = m.get("question") or m.get("title") or m.get("slug") or "Unknown"
             outs, prices, tokens = parse_list(m.get("outcomes")), parse_list(m.get("outcomePrices")), parse_list(m.get("clobTokenIds"))
             for i, o in enumerate(outs):
+                if not is_relevant_market(q, o):
+                    continue
                 price = None
                 if i < len(prices):
                     try: price = round(float(prices[i]) * 100, 2)
@@ -1894,22 +1915,22 @@ with tab1:
             st.markdown(line(t("시장 탐색에서 가져온 값이 입력칸에 반영되었습니다. 필요한 값만 조정하세요.", "Values from Market explorer are prefilled. Adjust anything you need."), "g"), unsafe_allow_html=True)
 
         with st.form("entry_form"):
+            # Important: do NOT bind these widgets to keys that market-explorer later mutates.
+            # Streamlit raises StreamlitAPIException if a rendered widget key is modified in the same run.
             market_name = st.text_input(
                 t("시장 이름", "Market name"),
-                value=st.session_state.get("entry_market_name", prefill.get("market_name", t("예: T1 vs HLE — Match Winner", "Ex: T1 vs HLE — Match Winner"))),
-                key="entry_market_name"
+                value=prefill.get("market_name", t("예: T1 vs HLE — Match Winner", "Ex: T1 vs HLE — Match Winner"))
             )
 
             category_options = [t("e스포츠", "Esports"), t("일반 스포츠", "Sports"), t("정치", "Politics"),
                  t("뉴스·이벤트", "News / events"), t("크립토", "Crypto"), t("기타", "Other")]
-            pref_cat = st.session_state.get("entry_category", prefill.get("category", category_options[-1]))
+            pref_cat = prefill.get("category", category_options[-1])
             if pref_cat not in category_options:
                 pref_cat = category_options[-1]
             category = st.selectbox(
                 t("시장 카테고리", "Market category"),
                 category_options,
-                index=category_options.index(pref_cat),
-                key="entry_category"
+                index=category_options.index(pref_cat)
             )
             cat_ko = category if st.session_state.lang == "ko" else {
                 "Esports": "e스포츠", "Sports": "일반 스포츠", "Politics": "정치",
@@ -1924,27 +1945,27 @@ with tab1:
                 "기타": ["기타"]
             }
             sub_list = sub_options.get(cat_ko, [t("기타", "Other")])
-            pref_sub = st.session_state.get("entry_subcategory", prefill.get("subcategory", sub_list[0]))
+            pref_sub = prefill.get("subcategory", sub_list[0])
             if pref_sub not in sub_list:
                 pref_sub = sub_list[0]
-            subcategory = st.selectbox(t("세부종목/분류", "Subcategory"), sub_list, index=sub_list.index(pref_sub), key="entry_subcategory")
+            subcategory = st.selectbox(t("세부종목/분류", "Subcategory"), sub_list, index=sub_list.index(pref_sub))
 
             is_match_market = cat_ko in ["e스포츠", "일반 스포츠"]
             c0a, c0b = st.columns(2)
             with c0a:
                 team_a = st.text_input(t("내가 보는 팀/선수", "My team/player") if is_match_market else t("대상/결과 A", "Target/outcome A"),
-                                       value=st.session_state.get("entry_team_a", prefill.get("outcome", "T1" if is_match_market else "Yes")), key="entry_team_a")
+                                       value=prefill.get("outcome", "T1" if is_match_market else "Yes"))
             with c0b:
                 team_b = st.text_input(t("상대 팀/선수", "Opponent") if is_match_market else t("비교대상/결과 B (선택)", "Compare/outcome B optional"),
-                                       value=st.session_state.get("entry_team_b", "HLE" if is_match_market else "No"), key="entry_team_b")
-            league = st.text_input(t("리그/메모", "League / note"), value=st.session_state.get("entry_league", prefill.get("note", "LCK" if cat_ko == "e스포츠" else subcategory)), key="entry_league")
+                                       value=prefill.get("opponent", "HLE" if is_match_market else "No"))
+            league = st.text_input(t("리그/메모", "League / note"), value=prefill.get("note", "LCK" if cat_ko == "e스포츠" else subcategory))
 
             c1, c2 = st.columns(2)
             with c1:
-                current_price = st.number_input(t("현재가 (¢)", "Price (¢)"), 1.0, 99.0, float(st.session_state.get("entry_current_price", prefill.get("current_price", 52.0))), key="entry_current_price")
+                current_price = st.number_input(t("현재가 (¢)", "Price (¢)"), 1.0, 99.0, float(prefill.get("current_price", 52.0)))
                 stake = st.number_input(t("투자금 ($)", "Stake ($)"), 1.0, value=50.0)
             with c2:
-                fair_price = st.number_input(t("내 적정가 (¢)", "My fair price (¢)"), 1.0, 99.0, max(1.0, min(99.0, float(st.session_state.get("entry_fair_price", prefill.get("fair_price", 65.0))))), key="entry_fair_price")
+                fair_price = st.number_input(t("내 적정가 (¢)", "My fair price (¢)"), 1.0, 99.0, max(1.0, min(99.0, float(prefill.get("fair_price", 65.0)))))
                 confidence = st.selectbox(t("확신 수준", "Conviction"), confidence_options(), index=2)
 
             c3, c4 = st.columns(2)
@@ -2079,6 +2100,8 @@ with tab_explore:
         else:
             st.markdown(f'<div class="eyebrow">{t("시장 카드", "Market cards")}</div>', unsafe_allow_html=True)
             for i, row in enumerate(rows):
+                if not is_relevant_market(row_get(row, "시장", "Market", ""), row_get(row, "선택지", "Outcome", "")):
+                    continue
                 token = str(row.get("token_id", "") or "")
                 clob = fetch_clob_price(token) if token else {"bid": None, "ask": None, "spread": None, "raw": {}}
                 book = fetch_clob_book(token) if token else {}
@@ -2094,17 +2117,19 @@ with tab_explore:
                 except Exception:
                     price_f = 52.0
                 with b1:
-                    if st.button(t("진입 판독으로 보내기", "Send to Entry"), key=f"send_entry_{i}_{token}", use_container_width=True):
-                        st.session_state.prefill_entry = {"market_name": name, "outcome": outcome, "current_price": max(1.0, min(99.0, price_f)), "fair_price": max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f)), "category": t("기타", "Other"), "subcategory": t("기타", "Other"), "note": f"token_id: {token[:16]}…" if token else "", "token_id": token}
-                        st.session_state.entry_market_name = name
-                        st.session_state.entry_team_a = outcome or "Yes"
-                        st.session_state.entry_team_b = "No"
-                        st.session_state.entry_current_price = max(1.0, min(99.0, price_f))
-                        st.session_state.entry_fair_price = max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f))
-                        st.session_state.entry_category = t("기타", "Other")
-                        st.session_state.entry_subcategory = t("기타", "Other")
-                        st.session_state.entry_league = f"token_id: {token[:16]}…" if token else "Polymarket URL"
-                        st.toast(t("진입 판독 탭에 값을 보냈습니다", "Sent values to Entry check"))
+                    if st.button(t("진입 판독으로 보내기", "Send to Entry"), key=f"send_entry_{i}_{token}_{outcome}", use_container_width=True):
+                        st.session_state.prefill_entry = {
+                            "market_name": name,
+                            "outcome": outcome or "Yes",
+                            "opponent": "No",
+                            "current_price": max(1.0, min(99.0, price_f)),
+                            "fair_price": max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f)),
+                            "category": t("기타", "Other"),
+                            "subcategory": t("기타", "Other"),
+                            "note": f"token_id: {token[:16]}…" if token else "Polymarket URL",
+                            "token_id": token,
+                        }
+                        st.toast(t("진입 판독 탭에서 확인하세요", "Check the Entry tab"))
                         st.rerun()
                 with b2:
                     if st.button(t("AI 시장 보고서", "AI market report"), key=f"ai_report_{i}_{token}", use_container_width=True):
