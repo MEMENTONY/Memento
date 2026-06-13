@@ -704,105 +704,101 @@ def get_api_key():
             return k
     return None
 
-def build_prompt(team_a, team_b="", league="", current_price=0, fair_price=None, purpose="", category="기타", market_name="", subcategory="", bookmaker_prob=None, bookmaker_source_memo="", ai_extra_context="", ai_context="", market_class="", **_ignore):
-    """Research-focused JSON prompt.
+def build_prompt(market_name, outcome="", current_price=0, category="기타", sub="",
+                 ai_context="", bookmaker_memo="", fair_price=None, edge=None,
+                 market_class="", bookmaker_prob=None, bookmaker_source_memo="",
+                 ai_extra_context="", **_ignore):
+    """Strict, research-focused JSON prompt.
 
-    App handles price/risk/bet-size. Claude handles external context/research.
-    Supports both legacy calls and URL-row calls.
+    calculate_entry handles price/risk/stake. Claude handles external research/context.
+    This schema is intentionally flat and stable so the UI can always render tables/cards.
     """
     lang = "ko" if st.session_state.lang == "ko" else "en"
-    market_name = str(market_name or (f"{team_a} vs {team_b}" if str(team_b or "").strip() else team_a) or "").strip()
-    outcome = str(team_a or "").strip()
-    category = str(category or t("기타", "Other")).strip()
-    subcategory = str(subcategory or league or "").strip()
+    category = str(category or "기타")
+    sub = str(sub or "")
+    market_name = str(market_name or "")
+    outcome = str(outcome or "")
     try:
-        current_price = float(current_price or 0)
+        current_price_f = float(current_price or 0)
     except Exception:
-        current_price = 0.0
+        current_price_f = 0.0
     try:
         fair_price_f = float(fair_price) if fair_price is not None else None
     except Exception:
         fair_price_f = None
-    edge_val = fair_price_f - current_price if fair_price_f is not None else None
-    bookmaker_view = "직접 입력 필요"
-    if bookmaker_prob not in (None, "", 0, 0.0):
+    try:
+        edge_f = float(edge) if edge is not None else (fair_price_f - current_price_f if fair_price_f is not None else None)
+    except Exception:
+        edge_f = None
+
+    cat = f"{category} {sub} {market_name}".lower()
+    sporty = any(k in cat for k in ("e스포츠", "esport", "스포츠", "sport", "lol", "lck", "lpl", "mlb", "baseball", "nba", "nfl", "ufc", "tennis", "soccer", "football"))
+    focus = ("스카우팅 리서치: 상대전적, 리그전적, 리그순위, 최근 5~10경기 폼, 로스터·부상·라인업·메타."
+             if sporty else
+             "정산 기준, 기간 리스크, 공식 출처, 뉴스 촉매, 유동성, 조건 정의.")
+
+    memo = str(ai_context or ai_extra_context or "").strip()
+    bkm = str(bookmaker_memo or bookmaker_source_memo or "").strip()
+    if not bkm and bookmaker_prob not in (None, "", 0, 0.0):
         try:
-            bookmaker_view = f"{float(bookmaker_prob):.1f}%"
+            bkm = f"북메이커 implied {float(bookmaker_prob):.1f}%"
         except Exception:
-            bookmaker_view = str(bookmaker_prob)
-    if bookmaker_source_memo:
-        bookmaker_view = f"{bookmaker_view} · {bookmaker_source_memo}" if bookmaker_view != "직접 입력 필요" else str(bookmaker_source_memo)
+            bkm = str(bookmaker_prob)
 
-    cat_low = f"{category} {subcategory} {league} {market_name}".lower()
-    sporty = any(k in cat_low for k in ["e스포츠", "esports", "sport", "스포츠", "lol", "lck", "lpl", "mlb", "nba", "nfl", "ufc", "tennis", "soccer", "baseball", "basketball"])
-    if sporty:
-        fields = '"recent_form","head_to_head","league_record","league_standing","roster_news"'
-        focus = "스카우팅 리서치: 최근 5~10경기, 상대전적, 리그 전적, 리그 순위, 로스터·부상·라인업, 메타/시리즈 맥락."
-        mtype = "full_match|game_map"
-    elif any(k in cat_low for k in ["정치", "politic", "election", "선거", "뉴스", "news", "event", "이벤트"]):
-        fields = '"resolution_basis","time_risk","official_source","news_catalysts","sentiment_risk"'
-        focus = "정산 기준, 기간 리스크, 공식 출처, 뉴스 촉매, 여론/시장 내러티브."
-        mtype = "politics|news"
-    elif any(k in cat_low for k in ["크립토", "crypto", "bitcoin", "btc", "eth"]):
-        fields = '"condition_definition","liquidity","volatility","news_catalysts","reference_price"'
-        focus = "조건 정의, 기준 거래소/가격, 유동성, 변동성, 촉매."
-        mtype = "crypto"
-    else:
-        fields = '"condition_definition","resolution_basis","liquidity","news_catalysts","market_structure"'
-        focus = "조건 정의, 정산 기준, 유동성, 시장 구조."
-        mtype = "other"
+    evidence = ""
+    if memo:
+        evidence += f"\nEXTERNAL_INFO(primary evidence):<<<{memo}>>>"
+    if bkm:
+        evidence += f"\nBOOKMAKER:<<<{bkm}>>>"
+    if not evidence:
+        evidence = "\nNo external info. Do NOT invent recent records/standings/odds/news. Unknown → missing_data only, set fields to '확인 필요', confidence='low'."
 
-    evidence_parts = []
-    if str(ai_context or ai_extra_context or "").strip():
-        evidence_parts.append(f"외부정보(1차 근거):<<<{str(ai_context or ai_extra_context).strip()}>>>")
-    if str(bookmaker_source_memo or "").strip():
-        evidence_parts.append(f"외부배당/출처 메모:<<<{str(bookmaker_source_memo).strip()}>>>")
-    evidence = "\n".join(evidence_parts) if evidence_parts else "외부정보 없음. 최근 결과·전적·뉴스 추측 절대 금지. 모르면 missing_data에만 넣고 각 섹션에는 반복하지 마."
-    payload = {
+    fair_txt = f"{fair_price_f:.1f}¢" if fair_price_f is not None else "확인 필요"
+    edge_txt = f"{edge_f:+.1f}¢" if edge_f is not None else "확인 필요"
+    bookmaker_txt = bkm if bkm else "직접 입력 필요"
+    lang_line = "All string values in Korean." if lang == "ko" else "All values English."
+
+    market_payload = {
         "name": market_name,
         "outcome": outcome,
         "category": category,
-        "sub": subcategory,
+        "sub": sub,
         "market_class": market_class,
-        "price_cent": current_price,
-        "user_fair_price_cent": fair_price_f,
-        "edge_cent": edge_val,
-        "bookmaker_view": bookmaker_view,
+        "polymarket_implied_pct": round(current_price_f, 1),
+        "user_fair_price": fair_txt,
+        "edge": edge_txt,
+        "bookmaker_view": bookmaker_txt,
     }
-    lang_line = "모든 값 한국어." if lang == "ko" else "All values English."
-    return f"""You are a betting research analyst for a Polymarket market. Return ONLY minified valid JSON. No markdown, no code fences, no text outside JSON.
 
-MARKET={json.dumps(payload, ensure_ascii=False)}
-FOCUS: {focus}
-{evidence}
+    return f"""You are a betting research analyst. Output ONE JSON object ONLY. No markdown, no ``` fences, no text before/after. All values are flat strings or string arrays. If unknown, write "확인 필요" and add to missing_data. Never invent data.
 
-Schema (all keys required):
+MARKET={json.dumps(market_payload, ensure_ascii=False)}
+FOCUS: {focus}{evidence}
+
+Return EXACTLY this shape:
 {{
-"report_title":"short",
+"report_title":"short title",
 "ai_stance":"favorable|neutral|risky",
-"stance_reason":"one short context-based reason, not price math",
-"research_summary":["b1","b2","b3"],
-"pre_match_table":{{{fields}}},
-"price_table":{{"polymarket_price":"{current_price}¢","polymarket_implied":"{current_price}%","user_fair_price":"{fair_price_f if fair_price_f is not None else '확인필요'}","edge":"{edge_val if edge_val is not None else '확인필요'}","bookmaker_view":"{bookmaker_view}","gap_comment":"short"}},
-"resolution_check":"what resolves this; full match vs game vs series",
-"key_variables":["3-5 bullets"],
-"missing_data":["unknown live items only; [] if none"]
+"ai_estimated_probability":"e.g. 58% or 확인 필요",
+"confidence":"high|medium|low",
+"summary_bullets":["b1","b2","b3"],
+"pre_match_table":{{"head_to_head":"...","league_record":"...","league_standing":"...","recent_form":"...","roster_news":"..."}},
+"odds_table":{{"polymarket_price":"{current_price_f:.1f}¢","polymarket_implied":"{current_price_f:.1f}%","user_fair_price":"{fair_txt}","user_edge":"{edge_txt}","bookmaker_view":"{bookmaker_txt}","gap_comment":"short"}},
+"resolution_check":"full match vs series vs game/map",
+"key_variables":["v1","v2","v3"],
+"ai_opinion":"1-2 sentence verdict, context-based not bet-size math",
+"missing_data":["unknown items only; [] if none"]
 }}
 
-RULES:
-- Do NOT focus on bet size/position size/recommended cap. App handles that.
-- Price only in price_table and short market-view comments.
-- Unknowns ONLY in missing_data, never per-section spam.
-- No invented recent results, rankings, lineups, injuries, news, or odds.
-- Report must be table/card friendly, no long paragraphs.
-- {lang_line}
+{lang_line} App already handles stake/risk/cap — do NOT center on bet sizing.
 """
+
 def call_claude(prompt):
     key = get_api_key()
     if not key:
         return None, "no_key"
     try:
-        payload = json.dumps({"model": "claude-sonnet-4-6", "max_tokens": 700,
+        payload = json.dumps({"model": "claude-sonnet-4-6", "max_tokens": 1500,
                               "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
         req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload,
                                      headers={"Content-Type": "application/json", "x-api-key": key,
@@ -880,74 +876,133 @@ def render_ai_report_text(text):
 
 
 def safe_json_parse(text):
+    """Parse Claude JSON robustly. Returns None on failure without raising."""
     if not text:
         return None
+    import re as _re
     s = str(text).strip()
-    if s.startswith("```"):
-        s = s.strip("`").strip()
-        if s.lower().startswith("json"):
-            s = s[4:].strip()
+    m = _re.search(r"```(?:json)?\s*(\{.*\})\s*```", s, _re.S)
+    if m:
+        s = m.group(1)
     a, b = s.find("{"), s.rfind("}")
     if a == -1 or b == -1 or b <= a:
         return None
-    try:
-        return json.loads(s[a:b + 1])
-    except Exception:
-        return None
+    frag = s[a:b + 1]
+    attempts = [
+        frag,
+        frag.replace("\n", " "),
+        _re.sub(r",\s*}", "}", _re.sub(r",\s*]", "]", frag)),
+        frag.replace("\\", ""),
+    ]
+    for attempt in attempts:
+        try:
+            return json.loads(attempt)
+        except Exception:
+            continue
+    return None
+
+
+def _ai_plain_fallback(text):
+    """If JSON parsing fails, still render a clean report-like card. Never show parser failure."""
+    import re as _re
+    s = str(text or "")
+    s = _re.sub(r"```.*?```", " ", s, flags=_re.S)
+    s = s.replace("#", "").replace("---", "").replace("{", " ").replace("}", " ").replace('"', "")
+    s = _re.sub(r"\s+", " ", s).strip()
+    bullets = [seg.strip() for seg in _re.split(r"(?<=[.!?。])\s+", s) if len(seg.strip()) > 8][:5]
+    st.markdown(f'<div class="verdict" style="border-top:none;padding-top:6px;">'
+                f'<div class="v-title" style="font-size:22px;"><span class="dot i"></span>{t("AI 리서치 요약","AI research")}</div></div>',
+                unsafe_allow_html=True)
+    if bullets:
+        st.markdown("".join(line(esc(b), "i") for b in bullets), unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="rc-missing"><div class="rc-h">{t("확인 필요 데이터","Verify manually")}</div>'
+                    f'<div>· {t("외부 정보를 입력하면 더 정확한 리포트를 생성합니다.","Add external info for a fuller report.")}</div></div>',
+                    unsafe_allow_html=True)
 
 
 def render_ai_report_json(text):
+    """Render AI research report as cards/tables. Never expose raw JSON or parse failure."""
     d = safe_json_parse(text)
     if not d:
-        clean = (text or "").replace("```json", "").replace("```", "").replace("#", "").replace("---", "").strip()
-        # Never show raw JSON blobs to normal users.
-        if clean.startswith("{") or '"report_title"' in clean or '"research_summary"' in clean:
-            clean = t("AI 리포트 형식 파싱에 실패했습니다. 다시 분석을 눌러주세요.", "AI report parse failed. Please run analysis again.")
-        st.markdown(f'<div class="rc-card"><div class="rc-h">{t("AI 소견","AI note")}</div>'
-                    f'<div class="rc-note">{esc(clean[:700]) if clean else t("리포트 불러오기 실패.","Report unavailable.")}</div></div>',
-                    unsafe_allow_html=True)
+        _ai_plain_fallback(text)
         return
 
-    stance = str(d.get("ai_stance") or (d.get("ai_opinion", {}) or {}).get("stance", "")).lower()
-    sk = {"favorable":"g", "neutral":"w", "risky":"b"}.get(stance, "i")
+    stance = str(d.get("ai_stance", "")).lower()
+    sk = {"favorable": "g", "neutral": "w", "risky": "b"}.get(stance, "i")
     title = d.get("report_title", t("AI 리서치", "AI research"))
-    reason = d.get("stance_reason") or (d.get("ai_opinion", {}) or {}).get("reason", "")
+    opinion = d.get("ai_opinion", "")
     st.markdown(f'<div class="verdict" style="border-top:none;padding-top:6px;">'
                 f'<div class="v-title" style="font-size:23px;"><span class="dot {sk}"></span>{esc(title)}</div>'
-                f'<div class="v-sub">{esc(reason)}</div></div>', unsafe_allow_html=True)
+                f'<div class="v-sub">{esc(opinion)}</div></div>', unsafe_allow_html=True)
 
-    rs = d.get("research_summary", []) or []
-    if rs:
-        st.markdown(f'<div class="rc-h" style="margin-top:8px;">{t("핵심 리서치 요약","Summary")}</div>' + "".join(line(esc(x), "i") for x in rs[:3]), unsafe_allow_html=True)
+    sb = [x for x in (d.get("summary_bullets") or d.get("research_summary") or []) if str(x).strip()][:3]
+    if sb:
+        st.markdown(f'<div class="rc-h" style="margin-top:8px;">{t("핵심 요약","Summary")}</div>'
+                    + "".join(line(esc(x), "i") for x in sb), unsafe_allow_html=True)
 
-    pre = d.get("pre_match_table") or d.get("context_table") or {}
-    if isinstance(pre, dict):
-        pre = {k: v for k, v in pre.items() if v and str(v).strip()}
+    LBL_PM = {
+        "head_to_head": t("상대전적", "H2H"),
+        "league_record": t("리그 전적", "League record"),
+        "league_standing": t("리그 순위", "Standing"),
+        "recent_form": t("최근 폼", "Recent form"),
+        "roster_news": t("로스터/뉴스", "Roster/news"),
+    }
+    pm = d.get("pre_match_table") or d.get("context_table") or {}
+    if isinstance(pm, dict):
+        pm_rows = [(LBL_PM.get(k, k), v) for k, v in pm.items() if str(v).strip()]
     else:
-        pre = {}
-    if pre:
+        pm_rows = []
+    if pm_rows:
+        st.markdown(f'<div class="rc-h" style="margin-top:12px;">{t("경기 전 정보","Pre-match")}</div>', unsafe_allow_html=True)
         try:
-            st.markdown(f'<div class="rc-h" style="margin-top:10px;">{t("경기전 정보","Pre-match research")}</div>', unsafe_allow_html=True)
-            st.table(pd.DataFrame([{t("항목","Field"): k, t("내용","Value"): v} for k, v in pre.items()]).set_index(t("항목","Field")))
+            st.table(pd.DataFrame([{t("항목","Field"): k, t("내용","Value"): v} for k, v in pm_rows]).set_index(t("항목","Field")))
         except Exception:
-            rows = "".join(f'<div class="rc-row"><span class="rc-k">{esc(k)}</span><span class="rc-v">{esc(v)}</span></div>' for k, v in pre.items())
-            st.markdown(f'<div class="rc-card" style="margin-top:10px;"><div class="rc-h">{t("경기전 정보","Pre-match research")}</div>{rows}</div>', unsafe_allow_html=True)
+            st.markdown('<div class="rc-card">' + "".join(f'<div class="rc-row"><span class="rc-k">{esc(k)}</span><span class="rc-v">{esc(v)}</span></div>' for k, v in pm_rows) + '</div>', unsafe_allow_html=True)
 
-    price = d.get("price_table") or d.get("odds_view") or {}
-    if isinstance(price, dict) and any(str(v).strip() for v in price.values()):
-        rows = "".join(f'<div class="rc-row"><span class="rc-k">{esc(k)}</span><span class="rc-v">{esc(v)}</span></div>' for k, v in price.items() if str(v).strip())
-        st.markdown(f'<div class="rc-card" style="margin-top:10px;"><div class="rc-h">{t("가격 / 괴리율","Price / gap")}</div>{rows}</div>', unsafe_allow_html=True)
+    LBL_OD = {
+        "polymarket_price": "Polymarket",
+        "polymarket_implied": t("시장 implied", "Implied"),
+        "user_fair_price": t("내 적정가", "My fair"),
+        "user_edge": "Edge",
+        "edge": "Edge",
+        "bookmaker_view": t("외부배당", "Bookmaker"),
+        "gap_comment": t("코멘트", "Note"),
+    }
+    od = d.get("odds_table") or d.get("price_table") or d.get("odds_view") or {}
+    if isinstance(od, dict):
+        od_rows = [(LBL_OD.get(k, k), v) for k, v in od.items() if str(v).strip()]
+    else:
+        od_rows = []
+    if od_rows:
+        st.markdown(f'<div class="rc-h" style="margin-top:12px;">{t("배당 · 확률 비교","Odds · probability")}</div>', unsafe_allow_html=True)
+        try:
+            st.table(pd.DataFrame([{t("항목","Field"): k, t("값","Value"): v} for k, v in od_rows]).set_index(t("항목","Field")))
+        except Exception:
+            st.markdown('<div class="rc-card">' + "".join(f'<div class="rc-row"><span class="rc-k">{esc(k)}</span><span class="rc-v">{esc(v)}</span></div>' for k, v in od_rows) + '</div>', unsafe_allow_html=True)
 
-    if d.get("resolution_check"):
-        st.markdown(f'<div class="rc-card" style="margin-top:10px;"><div class="rc-h">{t("정산 조건","Resolution")}</div><div class="rc-note">{esc(d.get("resolution_check", ""))}</div></div>', unsafe_allow_html=True)
+    prob = str(d.get("ai_estimated_probability", "")).strip()
+    conf = str(d.get("confidence", "")).strip().lower()
+    if prob:
+        ck = {"high": "g", "medium": "w", "low": "b"}.get(conf, "i")
+        st.markdown(f'<div class="rc-action"><div class="rc-h">{t("AI 예상 승률","AI estimated probability")}</div>'
+                    f'<div class="rc-row"><span class="rc-k">{t("예상 승률","Estimate")}</span><span class="rc-v"><b>{esc(prob)}</b></span></div>'
+                    f'<div class="rc-row"><span class="rc-k">{t("신뢰도","Confidence")}</span><span class="rc-v"><span class="state {ck}">{esc(conf or "—")}</span></span></div></div>',
+                    unsafe_allow_html=True)
 
-    kv = d.get("key_variables", []) or []
+    if str(d.get("resolution_check", "")).strip():
+        st.markdown(f'<div class="rc-card" style="margin-top:12px;"><div class="rc-h">{t("정산 조건","Resolution")}</div>'
+                    f'<div class="rc-note">{esc(d["resolution_check"])}</div></div>', unsafe_allow_html=True)
+
+    kv = [x for x in (d.get("key_variables") or []) if str(x).strip()]
     if kv:
-        st.markdown(f'<div class="rc-h" style="margin-top:12px;">{t("핵심 변수","Key variables")}</div>' + "".join(line(esc(x), "w") for x in kv), unsafe_allow_html=True)
+        st.markdown(f'<div class="rc-h" style="margin-top:12px;">{t("핵심 변수","Key variables")}</div>'
+                    + "".join(line(esc(x), "w") for x in kv), unsafe_allow_html=True)
 
-    md = d.get("missing_data", []) or []
+    md = [x for x in (d.get("missing_data") or []) if str(x).strip()]
     if md:
-        st.markdown(f'<div class="rc-missing"><div class="rc-h">{t("확인 필요 데이터","Verify manually")}</div>' + "".join(f"<div>· {esc(x)}</div>" for x in md) + '</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="rc-missing"><div class="rc-h">{t("확인 필요 데이터","Verify manually")}</div>'
+                    + "".join(f"<div>· {esc(x)}</div>" for x in md) + '</div>', unsafe_allow_html=True)
 
 def render_ai(text):
     render_ai_report_json(text)
@@ -2335,19 +2390,16 @@ def analyze_entry_row(row, stake, fair_price, confidence, purpose, category=None
     }
 
     prompt = build_prompt(
-        o,
-        "",
-        str(subcategory or "Polymarket URL"),
-        price,
-        float(fair_price),
-        purpose,
-        category,
-        f"{q} — {o}",
-        subcategory,
-        bookmaker_prob=float(adv.get("bookmaker_prob", 0.0) or 0.0),
-        bookmaker_source_memo=str(adv.get("bookmaker_source_memo", "") or adv.get("bookmaker_memo", "") or ""),
-        ai_extra_context=str(adv.get("ai_extra_context", "") or ""),
+        market_name=f"{q} — {o}",
+        outcome=o,
+        current_price=price,
+        category=category,
+        sub=subcategory,
         ai_context=ai_context,
+        bookmaker_memo=str(adv.get("bookmaker_source_memo", "") or adv.get("bookmaker_memo", "") or ""),
+        bookmaker_prob=float(adv.get("bookmaker_prob", 0.0) or 0.0),
+        fair_price=float(fair_price),
+        edge=result.get("edge"),
         market_class=row.get("market_class", ""),
     )
     prompt += "\n\nAPP_RESULT=" + json.dumps({
