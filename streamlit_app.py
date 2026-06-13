@@ -305,6 +305,7 @@ DEFAULTS = {
     "ai_report_cache": {},
     "ai_last_market_key": "",
     "ai_report_mode": "standard",
+    "_sel_pnl_keys": [],
     "_ai_memo_cache": "",
     "_ai_bk_cache": "",
     "dev_mode": False,
@@ -1749,6 +1750,215 @@ def merge_activity_into_log(items):
     return added
 
 
+
+# =====================================================
+# Auto trade P&L grouping helpers
+# =====================================================
+def safe_trade_float(x, default=0.0):
+    try:
+        if x is None or x == "":
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _norm_price_cent(p):
+    p = safe_trade_float(p)
+    if 0 < p <= 1:
+        return round(p * 100, 2)
+    return round(p, 2)
+
+
+def _trade_market_name(tr):
+    return (tr.get("name") or tr.get("title") or tr.get("market") or tr.get("slug") or
+            tr.get("eventSlug") or "Unknown")
+
+
+def _trade_outcome(tr):
+    return tr.get("outcome") or tr.get("side_outcome") or tr.get("result") or ""
+
+
+def _trade_token(tr):
+    return str(tr.get("token_id") or tr.get("asset") or tr.get("assetId") or tr.get("conditionId") or "")
+
+
+def _trade_side(tr):
+    side = str(tr.get("side") or "").upper()
+    typ = str(tr.get("type") or "").upper()
+    if side in ("BUY", "SELL"):
+        return side
+    if typ in ("BUY", "SELL"):
+        return typ
+    if "BUY" in side or "BUY" in typ:
+        return "BUY"
+    if "SELL" in side or "SELL" in typ:
+        return "SELL"
+    return side or typ
+
+
+def group_auto_trades_for_pnl(auto_trades):
+    """Group imported fills by market/outcome/token and estimate weighted P&L.
+
+    This intentionally treats API activity as an estimate. Manual journal P&L remains separate.
+    """
+    groups = {}
+    for tr in auto_trades or []:
+        if not isinstance(tr, dict):
+            continue
+        title = _trade_market_name(tr)
+        outcome = _trade_outcome(tr)
+        tok = _trade_token(tr)
+        key = tok if tok else f"{title}|{outcome}"
+        side = _trade_side(tr)
+        if side not in ("BUY", "SELL"):
+            continue
+        price = _norm_price_cent(tr.get("price"))
+        size = safe_trade_float(tr.get("shares", tr.get("size", 0)))
+        usdc_raw = tr.get("amount", tr.get("usdcSize", tr.get("usdValue", None)))
+        amount = safe_trade_float(usdc_raw) if usdc_raw is not None else size * (price / 100)
+        g = groups.setdefault(key, {
+            "market": title, "outcome": outcome, "token_id": tok,
+            "bought_shares": 0.0, "sold_shares": 0.0,
+            "buy_cost": 0.0, "sell_proceeds": 0.0,
+            "fills": 0,
+        })
+        g["fills"] += 1
+        if side == "BUY":
+            g["bought_shares"] += size
+            g["buy_cost"] += amount
+        elif side == "SELL":
+            g["sold_shares"] += size
+            g["sell_proceeds"] += amount
+
+    rows = []
+    for key, g in groups.items():
+        bs = g["bought_shares"]
+        ss = g["sold_shares"]
+        avg_buy_dollars = (g["buy_cost"] / bs) if bs > 0 else 0.0
+        avg_sell_dollars = (g["sell_proceeds"] / ss) if ss > 0 else 0.0
+        oversold = ss > bs + 1e-6
+        matched_shares = min(ss, bs)
+        matched_buy_cost = avg_buy_dollars * matched_shares
+        realized = g["sell_proceeds"] - matched_buy_cost if not oversold else None
+        remaining = max(bs - ss, 0.0)
+        remaining_cost = avg_buy_dollars * remaining
+        if oversold:
+            status = t("확인 필요(매도>매수)", "Verify (sold>bought)")
+        elif remaining > 1e-6 and ss > 0:
+            status = t("일부 청산", "Partly closed")
+        elif remaining > 1e-6:
+            status = t("보유 중", "Open")
+        else:
+            status = t("청산 완료", "Closed")
+        rows.append({
+            "key": key,
+            "market": g["market"],
+            "outcome": g["outcome"],
+            "token_id": g["token_id"],
+            "avg_buy_price": round(avg_buy_dollars * 100, 2),
+            "avg_sell_price": round(avg_sell_dollars * 100, 2),
+            "bought_shares": round(bs, 4),
+            "sold_shares": round(ss, 4),
+            "buy_cost": round(g["buy_cost"], 2),
+            "sell_proceeds": round(g["sell_proceeds"], 2),
+            "realized_pnl": None if realized is None else round(realized, 2),
+            "remaining_shares": round(remaining, 4),
+            "remaining_cost": round(remaining_cost, 2),
+            "status": status,
+            "fills": g["fills"],
+        })
+    rows.sort(key=lambda r: (r["status"], -abs(safe_trade_float(r.get("realized_pnl"), 0)), r["market"]))
+    return rows
+
+
+def summarize_selected_trade_groups(rows, selected_keys):
+    selected = [r for r in rows if r["key"] in selected_keys] if selected_keys else rows
+    buy_cost = sum(safe_trade_float(r.get("buy_cost")) for r in selected)
+    sell_proceeds = sum(safe_trade_float(r.get("sell_proceeds")) for r in selected)
+    realized = sum(safe_trade_float(r.get("realized_pnl"), 0) for r in selected if r.get("realized_pnl") is not None)
+    remaining_shares = sum(safe_trade_float(r.get("remaining_shares")) for r in selected)
+    remaining_cost = sum(safe_trade_float(r.get("remaining_cost")) for r in selected)
+    unverified = any(r.get("realized_pnl") is None for r in selected)
+    return {
+        "buy_cost": buy_cost,
+        "sell_proceeds": sell_proceeds,
+        "realized_pnl": realized,
+        "remaining_shares": remaining_shares,
+        "remaining_cost": remaining_cost,
+        "unverified": unverified,
+    }
+
+
+def render_trade_pnl_summary(auto_trades):
+    rows = group_auto_trades_for_pnl(auto_trades)
+    if not rows:
+        st.markdown(f'<div class="footnote">{t("불러온 자동 거래내역이 없습니다.", "No imported auto-trades.")}</div>', unsafe_allow_html=True)
+        return
+
+    select_col = t("선택", "Sel")
+    table_rows = []
+    for r in rows:
+        table_rows.append({
+            select_col: False,
+            t("시장", "Market"): r["market"],
+            t("선택지", "Outcome"): r["outcome"],
+            t("평균 매수", "Avg buy"): cents(r["avg_buy_price"]),
+            t("평균 매도", "Avg sell"): cents(r["avg_sell_price"]) if r["sold_shares"] > 0 else "—",
+            t("매수 수량", "Bought"): r["bought_shares"],
+            t("매도 수량", "Sold"): r["sold_shares"],
+            t("매수금", "Buy cost"): money(r["buy_cost"]),
+            t("매도금", "Proceeds"): money(r["sell_proceeds"]),
+            t("실현손익", "Realized"): t("확인 필요", "Verify") if r["realized_pnl"] is None else signed_money(r["realized_pnl"]),
+            t("잔여 수량", "Remaining"): r["remaining_shares"],
+            t("상태", "Status"): r["status"],
+            "_key": r["key"],
+        })
+    df = pd.DataFrame(table_rows)
+    disabled_cols = [c for c in df.columns if c != select_col]
+    edited = st.data_editor(
+        df,
+        hide_index=True,
+        use_container_width=True,
+        key="pnl_group_editor",
+        disabled=disabled_cols,
+        column_config={"_key": None},
+    )
+    selected_keys = []
+    try:
+        selected_keys = [rows[i]["key"] for i, v in enumerate(edited[select_col].tolist()) if bool(v)]
+    except Exception:
+        selected_keys = []
+    st.session_state._sel_pnl_keys = selected_keys
+    s = summarize_selected_trade_groups(rows, selected_keys)
+    label = t("선택 합계", "Selected total") if selected_keys else t("전체 합계", "All total")
+    st.markdown(f'<div class="eyebrow" style="margin-top:16px;">{t("거래내역 기준 추정손익", "Estimated P&L from trade history")} · {label}</div>', unsafe_allow_html=True)
+    pnl_tone = "pos" if s["realized_pnl"] >= 0 else "neg"
+    st.markdown(
+        '<div class="stats">'
+        + stat(t("총 매수금", "Buy cost"), money(s["buy_cost"]), "")
+        + stat(t("총 매도금", "Proceeds"), money(s["sell_proceeds"]), "")
+        + stat(t("실현손익(추정)", "Realized (est)"), signed_money(s["realized_pnl"]), t("매도금−대응매수원가", "proceeds−matched cost"), pnl_tone)
+        + stat(t("잔여 수량", "Remaining"), f'{s["remaining_shares"]:.4f}', t(f"원가 {money(s['remaining_cost'])}", f"cost {money(s['remaining_cost'])}"))
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+    if s["unverified"]:
+        st.markdown(line(t("일부 항목은 매도 수량이 매수보다 많아 손익이 부정확할 수 있습니다.", "Some rows have sold>bought; P&L may be inaccurate."), "w"), unsafe_allow_html=True)
+    st.markdown(f'<div class="footnote">{t("추정치입니다. 공식 포트폴리오 손익과 별개이며 아직 합산하지 않습니다.", "Estimate only. Separate from official portfolio P&L; not merged yet.")}</div>', unsafe_allow_html=True)
+
+    with st.expander(t("원본 체결(fill) 보기", "Raw fills"), expanded=False):
+        st.markdown(f'<div class="footnote" style="margin:0 0 8px 0;">{t("체결 수는 성과 지표가 아닙니다. 지정가 주문은 여러 체결로 쪼개질 수 있습니다.", "Fill count is not a performance metric. Limit orders can split into fills.")}</div>', unsafe_allow_html=True)
+        raw_rows = []
+        for r in rows:
+            raw_rows.append({
+                t("시장", "Market"): r["market"],
+                t("선택지", "Outcome"): r["outcome"],
+                t("체결 수", "Fills"): r["fills"],
+                t("상태", "Status"): r["status"],
+            })
+        st.dataframe(pd.DataFrame(raw_rows), use_container_width=True, hide_index=True)
+
 def summarize_activity(items):
     # Summarize imported activity for pattern review. Does not calculate realized P&L.
     now = datetime.now()
@@ -2705,59 +2915,39 @@ with tab4:
                     st.markdown(line(t(f"거래내역 불러오기 실패 — {e}", f"Activity import failed — {e}"), "b"), unsafe_allow_html=True)
 
         if st.session_state.auto_trades:
-            sm = habit_report(st.session_state.auto_trades)
-            st.markdown(f'<div class="eyebrow" style="margin-top:16px;">{t("자동 거래 요약", "Auto trade summary")}</div>', unsafe_allow_html=True)
-            st.markdown(
-                '<div class="trade-grid">'
-                f'<div class="trade-card"><div class="k">{t("전체 체결", "Total fills")}</div><div class="v">{sm["count"]}</div></div>'
-                f'<div class="trade-card"><div class="k">{t("오늘 / 이번 주", "Today / week")}</div><div class="v">{sm["today_count"]} / {sm["week_count"]}</div></div>'
-                f'<div class="trade-card"><div class="k">BUY / SELL</div><div class="v">{sm["buy_count"]} / {sm["sell_count"]}</div></div>'
-                f'<div class="trade-card"><div class="k">{t("총 거래금액", "Turnover")}</div><div class="v">{money(sm["total_amount"])}</div></div>'
-                '</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="eyebrow" style="margin-top:16px;">{t("거래내역 기준 추정손익", "Estimated P&L from trade history")}</div>', unsafe_allow_html=True)
+            render_trade_pnl_summary(st.session_state.auto_trades)
 
-            st.markdown(f'<div class="eyebrow">{t("거래습관 리포트", "Trading habit report")}</div>', unsafe_allow_html=True)
+            sm = habit_report(st.session_state.auto_trades)
+            st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("거래습관 리포트", "Trading habit report")}</div>', unsafe_allow_html=True)
             st.markdown(
                 f'<div class="verdict" style="padding:12px 0 10px 0;border-top:none;">'
-                f'<div class="v-title" style="font-size:28px;"><span class="dot {sm.get("habit_level", "i")}"></span>{esc(sm.get("habit_title", ""))}</div>'
-                f'<div class="v-sub">{t("자동 거래내역 기준의 행동 패턴 요약입니다. 실현손익 계산에는 아직 합산하지 않습니다.", "Behavior-pattern summary from imported activity. It is not yet merged into realized P&L.")}</div></div>',
+                f'<div class="v-title" style="font-size:26px;"><span class="dot {sm.get("habit_level", "i")}"></span>{esc(sm.get("habit_title", ""))}</div>'
+                f'<div class="v-sub">{t("거래 빈도·반복진입·고가추격 여부를 확인하는 행동 패턴 요약입니다. 손익 계산에는 위 추정손익 표를 사용하세요.", "Behavior-pattern summary for frequency, repeated entries and chasing. Use the P&L table above for estimated results.")}</div></div>',
                 unsafe_allow_html=True)
             st.markdown(''.join(f'<div class="trade-insight"><span class="dot {kk}"></span>{esc(txt)}</div>' for kk, txt in sm.get("habit_insights", [])), unsafe_allow_html=True)
 
-            market_rows = activity_market_table(st.session_state.auto_trades)
-            if market_rows:
-                st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("시장별 거래 요약", "Market-level summary")}</div>', unsafe_allow_html=True)
-                market_view = pd.DataFrame([{
-                    t("시장", "Market"): r["market"],
-                    t("체결 수", "Fills"): r["count"],
-                    "BUY": r["buy"],
-                    "SELL": r["sell"],
-                    t("거래금액", "Turnover"): money(r["amount"]),
-                    t("최근 거래", "Last"): r["last"],
-                } for r in market_rows])
-                st.dataframe(market_view, use_container_width=True, hide_index=True)
-
-            with st.expander(t("원본 자동 거래내역", "Raw imported trade table"), expanded=False):
-                auto_view = pd.DataFrame([{
-                    t("날짜", "Date"): tr["d"][:16],
-                    t("시장", "Market"): tr["name"],
-                    t("선택", "Outcome"): tr["outcome"],
-                    t("매수/매도", "Side"): tr["side"],
-                    t("가격", "Price"): cents(tr["price"]),
-                    t("수량", "Shares"): tr["shares"],
-                    t("금액", "Amount"): money(tr["amount"]),
-                } for tr in st.session_state.auto_trades])
-                st.dataframe(auto_view, use_container_width=True, hide_index=True)
-                csv_auto = auto_view.to_csv(index=False).encode("utf-8-sig")
-                ca, cb = st.columns(2)
-                with ca:
-                    st.download_button(t("자동 거래내역 CSV", "Download auto trades CSV"), data=csv_auto, file_name="memento_auto_trades.csv", mime="text/csv", use_container_width=True)
-                with cb:
-                    if st.button(t("자동 거래내역 비우기", "Clear auto trades"), use_container_width=True):
-                        st.session_state.auto_trades = []
-                        st.session_state.imported_tx_ids = []
-                        st.rerun()
+            auto_view = pd.DataFrame([{
+                t("날짜", "Date"): tr.get("d", "")[:16],
+                t("시장", "Market"): tr.get("name", tr.get("title", "")),
+                t("선택", "Outcome"): tr.get("outcome", ""),
+                t("매수/매도", "Side"): tr.get("side", ""),
+                t("가격", "Price"): cents(_norm_price_cent(tr.get("price"))),
+                t("수량", "Shares"): tr.get("shares", tr.get("size", 0)),
+                t("금액", "Amount"): money(safe_trade_float(tr.get("amount", tr.get("usdcSize", 0)))),
+            } for tr in st.session_state.auto_trades])
+            csv_auto = auto_view.to_csv(index=False).encode("utf-8-sig")
+            ca, cb = st.columns(2)
+            with ca:
+                st.download_button(t("자동 거래내역 CSV", "Download auto trades CSV"), data=csv_auto, file_name="memento_auto_trades.csv", mime="text/csv", use_container_width=True)
+            with cb:
+                if st.button(t("자동 거래내역 비우기", "Clear auto trades"), use_container_width=True):
+                    st.session_state.auto_trades = []
+                    st.session_state.imported_tx_ids = []
+                    st.session_state._sel_pnl_keys = []
+                    st.rerun()
         else:
-            st.markdown(f'<div class="footnote">{t("거래내역을 불러오면 자동 요약과 패턴 분석이 여기에 표시됩니다.", "Import activity to see automatic summaries and pattern analysis here.")}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="footnote">{t("거래내역을 불러오면 시장별 평균 매수가·평균 매도가·추정손익이 여기에 표시됩니다.", "Import activity to see market-level average buy/sell and estimated P&L here.")}</div>', unsafe_allow_html=True)
 
         if st.session_state.get("dev_mode", False):
             with st.expander(t("디버그 — activity raw 응답", "Debug — raw activity response")):
