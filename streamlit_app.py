@@ -264,6 +264,7 @@ DEFAULTS = {
     "explore_markets": [],
     "explore_raw": [],
     "explore_url": "https://polymarket.com/event/",
+    "_explorer_active": "",
     "prefill_entry": {},
     "explore_ai_text": "", "explore_ai_error": "", "explore_ai_prompt": "", "explore_ai_pair": "",
     "ai_text": "", "ai_error": "", "ai_prompt": "", "ai_pair": "",
@@ -2150,6 +2151,110 @@ with tab1:
 
 
 
+
+
+def _safe_price(v, default=50.0):
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def analyze_market_from_card(row):
+    """Run entry judgment + Claude report from a market explorer row.
+    Uses prefill_entry; never mutates widget-bound keys.
+    """
+    name = row_get(row, "시장", "Market", "Unknown") or "Unknown"
+    outcome = row_get(row, "선택지", "Outcome", "") or "Yes"
+    token = str(row.get("token_id", "") or "")
+    raw_price = row_get(row, "현재가 (¢)", "Price (¢)", None)
+    price = max(1.0, min(99.0, _safe_price(raw_price, 50.0)))
+
+    bankroll = effective_bankroll()
+    if not bankroll or bankroll <= 0:
+        bankroll = profile().get("assets", 1000.0) or 1000.0
+    fair_price = max(1.0, min(99.0, price + 5 if price <= 94 else price))
+    stake = min(50.0, bankroll * 0.03) if bankroll else 50.0
+    target_price = min(price + 10.0, 99.0)
+    stop_price = max(price - 10.0, 1.0)
+    category = infer_market_category(st.session_state.get("explore_url", ""), name)
+    subcategory = infer_market_subcategory(st.session_state.get("explore_url", ""), name)
+
+    data = dict(
+        market_name=f"{name} — {outcome}",
+        team_a=outcome,
+        team_b="",
+        league="Polymarket URL",
+        category=category,
+        subcategory=subcategory,
+        current_price=price,
+        fair_price=fair_price,
+        stake=stake,
+        purpose=purpose_options()[0],
+        market_type="Match Moneyline",
+        bankroll=bankroll,
+        confidence=confidence_options()[2],
+        target_price=target_price,
+        stop_price=stop_price,
+        bookmaker_prob=0.0,
+        previous_good_price=0.0,
+        duplicate_ml=0.0,
+        duplicate_game=0.0,
+        duplicate_side=0.0,
+        fomo_count=0,
+    )
+    st.session_state.prefill_entry = {
+        "market_name": f"{name} — {outcome}",
+        "outcome": outcome,
+        "opponent": "",
+        "current_price": price,
+        "fair_price": fair_price,
+        "category": category,
+        "subcategory": subcategory,
+        "note": f"token_id: {token[:16]}…" if token else "Polymarket URL",
+        "token_id": token,
+    }
+    result = calculate_entry(data)
+    st.session_state.last_entry = result
+
+    prompt = build_prompt(
+        outcome or name,
+        "",
+        "Polymarket URL",
+        price,
+        fair_price,
+        t("시장 탐색", "Market explorer"),
+        category,
+        name,
+        subcategory,
+    )
+    prompt += (
+        f"\n\n추가 시장 데이터:"
+        f"\n- Market URL: {st.session_state.get('explore_url', '') or 'https://polymarket.com'}"
+        f"\n- Outcome: {outcome}"
+        f"\n- Token ID: {token or '데이터 없음 / 직접 확인 필요'}"
+        f"\n- 현재가: {price}¢"
+        f"\n- 앱 자동판정: {result.get('decision', '')} / final {result.get('final_score', '')}%"
+        f"\n- 추천 상한선: {money(result.get('rec_cap', 0))}"
+        f"\n주의: 최신 경기 결과, 선발/라인업/부상/뉴스 정보가 제공되지 않았으면 반드시 '데이터 없음 / 직접 확인 필요'라고 쓰세요."
+    )
+    st.session_state.explore_ai_prompt = prompt
+    st.session_state.explore_ai_pair = f"{name} · {outcome}"
+    st.session_state.ai_prompt = prompt
+    st.session_state.ai_pair = f"{name} · {outcome}"
+    try:
+        text, err = call_claude(prompt)
+    except Exception as e:
+        text, err = None, str(e)
+    st.session_state.explore_ai_text = text or ""
+    st.session_state.explore_ai_error = err or ""
+    st.session_state.ai_text = text or ""
+    st.session_state.ai_error = err or ""
+    return result
+
+
 # =====================================================
 # Tab — Market explorer
 # =====================================================
@@ -2198,72 +2303,33 @@ with tab_explore:
             st.markdown(f'<div class="eyebrow">{t("시장 카드", "Market cards")}</div>', unsafe_allow_html=True)
             for i, row in enumerate(rows):
                 token = str(row.get("token_id", "") or "")
-                clob = fetch_clob_price(token) if token else {"bid": None, "ask": None, "spread": None, "raw": {}}
-                book = fetch_clob_book(token) if token else {}
-                hist = fetch_price_history(token) if token else {}
-                cand = build_order_candidate(row, clob, effective_bankroll())
-                st.markdown(market_card_html(row, clob, book, hist, cand), unsafe_allow_html=True)
-                b1, b2, b3, b4 = st.columns([1.05, 1.05, 1, 1])
+                token_key = token if token else f"idx_{i}"
                 name = row_get(row, "시장", "Market", "Unknown")
                 outcome = row_get(row, "선택지", "Outcome", "")
-                price = row_get(row, "현재가 (¢)", "Price (¢)", 52.0)
-                try:
-                    price_f = float(price)
-                except Exception:
-                    price_f = 52.0
-                with b1:
-                    if st.button(t("진입 판독으로 보내기", "Send to Entry"), key=f"send_entry_{i}_{token}_{outcome}", use_container_width=True):
-                        st.session_state.prefill_entry = {
-                            "market_name": name,
-                            "outcome": outcome or "Yes",
-                            "opponent": "No",
-                            "current_price": max(1.0, min(99.0, price_f)),
-                            "fair_price": max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f)),
-                            "category": infer_market_category(st.session_state.explore_url, name),
-                            "subcategory": infer_market_subcategory(st.session_state.explore_url, name),
-                            "note": f"token_id: {token[:16]}…" if token else "Polymarket URL",
-                            "token_id": token,
-                        }
-                        st.toast(t("진입 판독 탭에서 확인하세요", "Check the Entry tab"))
-                        st.rerun()
-                with b2:
-                    if st.button(t("AI 시장 보고서", "AI market report"), key=f"ai_report_{i}_{token}_{outcome}", use_container_width=True):
-                        cat = infer_market_category(st.session_state.explore_url, name)
-                        sub = infer_market_subcategory(st.session_state.explore_url, name)
-                        safe_price = max(1.0, min(99.0, price_f)) if price_f else 50.0
-                        prompt = build_prompt(
-                            outcome or name,
-                            "",
-                            "Polymarket URL",
-                            safe_price,
-                            max(1.0, min(99.0, safe_price + 5 if safe_price <= 94 else safe_price)),
-                            t("시장 탐색", "Market explorer"),
-                            cat,
-                            name,
-                            sub,
-                        )
-                        prompt += (
-                            f"\n\n추가 시장 데이터:"
-                            f"\n- Market URL: {st.session_state.explore_url}"
-                            f"\n- Category: {cat} / {sub}"
-                            f"\n- Best bid: {clob.get('bid')}¢"
-                            f"\n- Best ask: {clob.get('ask')}¢"
-                            f"\n- Spread: {clob.get('spread')}¢"
-                            f"\n- History change: {history_summary(hist).get('change')}¢"
-                            f"\n- Resolution: {row.get('resolution', '') or '데이터 없음 / 직접 확인 필요'}"
-                            f"\n- 주문 후보: {cand.get('limit_price')}¢ / {money(cand.get('max_amount', 0))}\n"
-                            f"\n주의: 최신 경기 결과, 선발/라인업/부상/뉴스 정보가 제공되지 않았으면 반드시 '데이터 없음 / 직접 확인 필요'라고 쓰세요."
-                        )
-                        st.session_state.explore_ai_prompt = prompt
-                        st.session_state.explore_ai_pair = f"{name} · {outcome}"
-                        with st.spinner(t("AI 보고서 생성 중", "Generating AI report")):
-                            text, err = call_claude(prompt)
-                        st.session_state.explore_ai_text = text or ""
-                        st.session_state.explore_ai_error = err or ""
-                        st.rerun()
-                with b3:
-                    if st.button(t("관심시장 추가", "Add watch"), key=f"watch_{i}_{token}", use_container_width=True):
-                        item = {"name": name, "outcome": outcome, "price": price_f, "token_id": token, "url": st.session_state.explore_url, "target": max(1.0, price_f - 5), "added": datetime.now().isoformat()}
+                raw_price = row_get(row, "현재가 (¢)", "Price (¢)", None)
+                price_missing = raw_price is None or raw_price == ""
+                price_f = max(1.0, min(99.0, _safe_price(raw_price, 50.0)))
+                price_badge = '<span class="state w">가격 없음</span>' if price_missing else ''
+                token_label = _escape(token[:18] + '…') if token else '—'
+
+                st.markdown(
+                    f"""<div class="market-card">
+<div class="market-title">{_escape(name)}</div>
+<div class="market-sub"><b>{_escape(outcome)}</b> · {cents(price_f)} {price_badge}</div>
+<div class="market-note">token: {token_label}</div>
+</div>""",
+                    unsafe_allow_html=True,
+                )
+
+                c_an, c_watch, c_open = st.columns([1.15, 1, 1])
+                with c_an:
+                    if st.button(t("시장 분석", "Analyze market"), key=f"analyze_market_{i}_{token_key}", use_container_width=True):
+                        with st.spinner(t("시장 판독과 AI 분석을 실행 중", "Running verdict and AI analysis")):
+                            analyze_market_from_card(row)
+                        st.session_state["_explorer_active"] = f"{i}_{token_key}"
+                with c_watch:
+                    if st.button(t("관심시장 추가", "Add watch"), key=f"watch_{i}_{token_key}", use_container_width=True):
+                        item = {"name": name, "outcome": outcome, "price": price_f, "token_id": token, "url": st.session_state.get("explore_url", ""), "target": max(1.0, price_f - 5), "added": datetime.now().isoformat()}
                         existing = {x.get("token_id") or (x.get("name"), x.get("outcome")) for x in st.session_state.watchlist}
                         key_ = token or (name, outcome)
                         if key_ not in existing:
@@ -2271,29 +2337,28 @@ with tab_explore:
                             st.toast(t("관심시장에 추가했습니다", "Added to watchlist"))
                         else:
                             st.toast(t("이미 관심시장에 있습니다", "Already in watchlist"))
-                        st.rerun()
-                with b4:
-                    st.link_button(t("원본 열기", "Open original"), url or "https://polymarket.com", use_container_width=True)
+                with c_open:
+                    st.link_button(t("원본 열기", "Open original"), st.session_state.get("explore_url", "") or "https://polymarket.com", use_container_width=True)
 
-            if st.session_state.get("dev_mode", False):
-                with st.expander(t("원본 시장 데이터", "Raw market data")):
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                    st.json(st.session_state.explore_raw)
-                    st.caption(t("CLOB book/history는 카드별로 캐시 호출됩니다. 실패 시 카드에서 — 로 표시됩니다.", "CLOB book/history is fetched per card with cache. Failures show as —."))
-
+                active_key = f"{i}_{token_key}"
+                if st.session_state.get("_explorer_active") == active_key and st.session_state.get("last_entry"):
+                    r = st.session_state.last_entry
+                    k = verdict_dot(r.get("level", ""))
+                    st.markdown(
+                        f"""<div class="verdict" style="padding-top:14px;margin-bottom:8px;">
+<div class="v-title" style="font-size:26px;"><span class="dot {k}"></span>{r.get('decision','')}</div>
+<div class="v-sub">{t('적절성','Suitability')} {float(r.get('final_score',0)):.0f}% · {t('현재가','Price')} {cents(float(r.get('current_price', price_f)))} · Edge {float(r.get('edge',0)):+.1f}¢ · {t('추천 상한선','Cap')} {money(float(r.get('rec_cap',0)))}</div>
+</div>""",
+                        unsafe_allow_html=True,
+                    )
+                    if st.session_state.get("explore_ai_text"):
+                        render_ai(st.session_state.explore_ai_text)
+                    elif st.session_state.get("explore_ai_error"):
+                        st.markdown(line(t(f"AI 실패 ({st.session_state.explore_ai_error}) — 프롬프트를 확인하세요.", f"AI failed ({st.session_state.explore_ai_error}) — check prompt."), "w"), unsafe_allow_html=True)
+                        if st.session_state.get("explore_ai_prompt"):
+                            st.code(st.session_state.explore_ai_prompt)
     with ex_right:
-        st.markdown(f'<div class="eyebrow">{t("AI 시장 보고서", "AI market report")}</div>', unsafe_allow_html=True)
-        if st.session_state.explore_ai_text:
-            st.markdown(f'<div class="footnote" style="margin-bottom:4px;">{_escape(st.session_state.explore_ai_pair)}</div>', unsafe_allow_html=True)
-            render_ai(st.session_state.explore_ai_text)
-        elif st.session_state.explore_ai_error:
-            st.markdown(line(t(f"AI 보고서 실패 — {st.session_state.explore_ai_error}", f"AI report failed — {st.session_state.explore_ai_error}"), "w"), unsafe_allow_html=True)
-            if st.session_state.explore_ai_prompt:
-                st.code(st.session_state.explore_ai_prompt)
-        else:
-            st.markdown(f"""<div class="quiet"><div class="q-title">{t('보고서가 여기에 표시됩니다', 'Report appears here')}</div><div class="q-body">{t('시장 카드에서 AI 시장 보고서를 누르세요.', 'Press AI market report on a market card.')}</div></div>""", unsafe_allow_html=True)
-
-        st.markdown(f'<div class="eyebrow" style="margin-top:22px;">{t("Watchlist", "Watchlist")}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="eyebrow">{t("Watchlist", "Watchlist")}</div>', unsafe_allow_html=True)
         if st.session_state.watchlist:
             for wi, item in enumerate(list(st.session_state.watchlist)):
                 pnow = item.get("price", 0)
