@@ -301,6 +301,12 @@ DEFAULTS = {
     "habit_cache": {},
     "pnl_raw": {},
     "profile_pnl": {},
+    "ai_pending": {},
+    "ai_report_cache": {},
+    "ai_last_market_key": "",
+    "ai_report_mode": "standard",
+    "_ai_memo_cache": "",
+    "_ai_bk_cache": "",
     "dev_mode": False,
     "reviews": [],
 }
@@ -707,7 +713,7 @@ def get_api_key():
 def build_prompt(market_name, outcome="", current_price=0, category="기타", sub="",
                  ai_context="", bookmaker_memo="", fair_price=None, edge=None,
                  market_class="", bookmaker_prob=None, bookmaker_source_memo="",
-                 ai_extra_context="", **_ignore):
+                 ai_extra_context="", report_mode="standard", **_ignore):
     """Strict, research-focused JSON prompt.
 
     calculate_entry handles price/risk/stake. Claude handles external research/context.
@@ -757,6 +763,11 @@ def build_prompt(market_name, outcome="", current_price=0, category="기타", su
     edge_txt = f"{edge_f:+.1f}¢" if edge_f is not None else "확인 필요"
     bookmaker_txt = bkm if bkm else "직접 입력 필요"
     lang_line = "All string values in Korean." if lang == "ko" else "All values English."
+    mode_instruction = {
+        "brief": "Output must be compact: summary_bullets 2 items, key_variables 3 items, each value 1 short sentence.",
+        "standard": "Output standard length: summary_bullets 3 items, key_variables 3 items, concise values.",
+        "detailed": "Output detailed report: each table value 2-3 sentences, key_variables 5 items."
+    }.get(str(report_mode or "standard"), "Output standard length.")
 
     market_payload = {
         "name": market_name,
@@ -774,6 +785,7 @@ def build_prompt(market_name, outcome="", current_price=0, category="기타", su
 
 MARKET={json.dumps(market_payload, ensure_ascii=False)}
 FOCUS: {focus}{evidence}
+REPORT_MODE: {report_mode}. {mode_instruction}
 
 Return EXACTLY this shape:
 {{
@@ -793,12 +805,13 @@ Return EXACTLY this shape:
 {lang_line} App already handles stake/risk/cap — do NOT center on bet sizing.
 """
 
-def call_claude(prompt):
+def call_claude(prompt, mode="standard"):
     key = get_api_key()
     if not key:
         return None, "no_key"
+    max_tokens = {"brief": 700, "standard": 1500, "detailed": 2200}.get(str(mode or "standard"), 1500)
     try:
-        payload = json.dumps({"model": "claude-sonnet-4-6", "max_tokens": 1500,
+        payload = json.dumps({"model": "claude-sonnet-4-6", "max_tokens": max_tokens,
                               "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
         req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload,
                                      headers={"Content-Type": "application/json", "x-api-key": key,
@@ -2159,8 +2172,9 @@ st.markdown(
     f'{t("감정 한도", "cap")} {money(prof["emotional_limit"])}</div>',
     unsafe_allow_html=True)
 
-tab1, tab_pf, tab2, tab3, tab4, tab_set = st.tabs([
+tab1, tab_ai, tab_pf, tab2, tab3, tab4, tab_set = st.tabs([
     t("진입 판독", "Entry check"),
+    t("AI 리서치", "AI research"),
     t("포트폴리오", "Portfolio"),
     t("포지션 관리", "Positions"),
     t("부분매도", "Partial sell"),
@@ -2323,7 +2337,7 @@ def _safe_price(v, default=50.0):
 
 
 def analyze_entry_row(row, stake, fair_price, confidence, purpose, category=None, subcategory=None, ai_context="", adv=None):
-    """Build entry judgment + Claude JSON report from a Polymarket URL row."""
+    """Build deterministic entry judgment only. Claude is called only from the AI research tab."""
     mk = t("시장", "Market")
     oc = t("선택지", "Outcome")
     pc = t("현재가 (¢)", "Price (¢)")
@@ -2337,7 +2351,6 @@ def analyze_entry_row(row, stake, fair_price, confidence, purpose, category=None
         category = infer_market_category(st.session_state.get("entry_url", "") or st.session_state.get("explore_url", ""), q)
     if subcategory is None:
         subcategory = infer_market_subcategory(st.session_state.get("entry_url", "") or st.session_state.get("explore_url", ""), q)
-    ai_context = str(ai_context or adv.get("ai_extra_context", "") or "")
     market_type = adv.get("market_type") or "Match Moneyline"
 
     data = dict(
@@ -2388,48 +2401,7 @@ def analyze_entry_row(row, stake, fair_price, confidence, purpose, category=None
         "subcategory": subcategory,
         "analyzed_at": datetime.now().isoformat(timespec="seconds"),
     }
-
-    prompt = build_prompt(
-        market_name=f"{q} — {o}",
-        outcome=o,
-        current_price=price,
-        category=category,
-        sub=subcategory,
-        ai_context=ai_context,
-        bookmaker_memo=str(adv.get("bookmaker_source_memo", "") or adv.get("bookmaker_memo", "") or ""),
-        bookmaker_prob=float(adv.get("bookmaker_prob", 0.0) or 0.0),
-        fair_price=float(fair_price),
-        edge=result.get("edge"),
-        market_class=row.get("market_class", ""),
-    )
-    prompt += "\n\nAPP_RESULT=" + json.dumps({
-        "decision": result.get("decision"),
-        "final_score": result.get("final_score"),
-        "value_score": result.get("value_score"),
-        "edge": result.get("edge"),
-        "stake": float(stake),
-        "bankroll": bankroll,
-        "position_pct": result.get("position_pct"),
-        "recommended_cap": result.get("rec_cap"),
-        "token_id": tok,
-        "bookmaker_prob": float(adv.get("bookmaker_prob", 0.0) or 0.0),
-        "bookmaker_source_memo": str(adv.get("bookmaker_source_memo", "") or ""),
-        "ai_extra_context": str(adv.get("ai_extra_context", "") or ""),
-        "url": st.session_state.get("entry_url", ""),
-    }, ensure_ascii=False)
-
-    st.session_state.ai_extra_context = str(adv.get("ai_extra_context", "") or "")
-    st.session_state.ai_prompt = prompt
-    st.session_state.ai_pair = f"{q} — {o}"
-    try:
-        text, err = call_claude(prompt)
-    except Exception as e:
-        text, err = None, str(e)
-    st.session_state.ai_text = text or ""
-    st.session_state.ai_error = err or ""
     return result
-
-
 
 
 def _market_table(rows, section_key):
@@ -2514,14 +2486,34 @@ def _selected_entry_form(entry_category, entry_subcategory):
 
     if st.session_state.get("_entry_active") == keytok and st.session_state.get("last_entry"):
         render_entry_result(st.session_state.last_entry)
-        st.markdown(f'<div class="eyebrow" style="margin-top:16px;">{t("AI 리서치 리포트", "AI research report")}</div>', unsafe_allow_html=True)
-        if st.session_state.get("ai_text"):
-            render_ai_report_json(st.session_state.ai_text)
-        elif st.session_state.get("ai_error"):
-            st.markdown(line(t("AI 일시 실패 — 잠시 후 재시도.", "AI temporarily failed — retry soon."), "w"), unsafe_allow_html=True)
         if st.session_state.get("watching_market", {}).get("token_id"):
             st.markdown(f'<div class="eyebrow" style="margin-top:16px;">{t("실시간 가격 추적", "Live price watch")}</div>', unsafe_allow_html=True)
             render_live_price_panel(st.session_state.watching_market)
+        if st.button(t("AI 분석 탭으로 보내기", "Send to AI tab"), key=f"toai_{keytok}", use_container_width=True):
+            r = st.session_state.last_entry
+            memo_for_ai = str(st.session_state.get("sel_ai_memo", "") or "")
+            bk_for_ai = str(st.session_state.get("sel_bm", "") or "")
+            st.session_state.ai_pending = {
+                "market": sel.get(mk, ""),
+                "outcome": sel.get(oc, ""),
+                "token_id": tok,
+                "market_class": sel.get("market_class", ""),
+                "current_price": r.get("current_price", disp),
+                "fair_price": r.get("fair_price", disp),
+                "edge": r.get("edge", 0.0),
+                "category": entry_category,
+                "subcategory": entry_subcategory,
+                "bookmaker_prob": float(st.session_state.get("sel_book", 0.0) or 0.0),
+                "bookmaker_memo": bk_for_ai,
+                "ai_memo": memo_for_ai,
+                "source_url": st.session_state.get("entry_url", ""),
+            }
+            st.session_state._ai_memo_cache = memo_for_ai
+            st.session_state._ai_bk_cache = bk_for_ai
+            st.session_state.ai_text = ""
+            st.session_state.ai_error = ""
+            st.session_state.ai_last_market_key = ""
+            st.success(t("AI 리서치 탭에서 리포트를 생성하세요", "Generate the report in the AI research tab"))
 
 
 with tab1:
@@ -2857,6 +2849,103 @@ with tab4:
 # =====================================================
 # Tab 5 — Portfolio (now last among data tabs)
 # =====================================================
+# =====================================================
+# Tab AI — Optional Claude research report
+# =====================================================
+with tab_ai:
+    st.markdown(f'<div class="headline">{t("AI 리서치", "AI research")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="subline">{t("토큰 절약을 위해 이 탭에서 버튼을 눌렀을 때만 Claude를 호출합니다.", "To save tokens, Claude is called only when you press the button here.")}</div>', unsafe_allow_html=True)
+
+    pend = st.session_state.get("ai_pending", {}) or {}
+    if not pend.get("token_id"):
+        st.markdown(
+            f'''<div class="quiet">
+<div class="q-title">{t("대기 중인 시장이 없습니다", "No market pending")}</div>
+<div class="q-body">{t("진입 판독에서 시장을 분석한 뒤 ‘AI 분석 탭으로 보내기’를 누르세요.", "Analyze a market in Entry, then press ‘Send to AI tab’.")}</div>
+</div>''',
+            unsafe_allow_html=True,
+        )
+    else:
+        q = pend.get("market", "")
+        o = pend.get("outcome", "")
+        current_price = float(pend.get("current_price", 0.0) or 0.0)
+        fair_price = float(pend.get("fair_price", 0.0) or 0.0)
+        edge = float(pend.get("edge", 0.0) or 0.0)
+        category = pend.get("category", "기타")
+        subcategory = pend.get("subcategory", "")
+        st.markdown(
+            f'<div class="spec-row"><div class="spec-key">{esc(q)}</div>'
+            f'<div class="spec-val"><b>{esc(o)}</b> · {cents(current_price)} · Edge {edge:+.1f}¢ · {esc(str(category))}</div><div></div></div>',
+            unsafe_allow_html=True,
+        )
+
+        mode_label = st.selectbox(
+            t("리포트 상세도", "Report depth"),
+            [t("요약", "Brief"), t("표준", "Standard"), t("상세", "Detailed")],
+            index={"brief": 0, "standard": 1, "detailed": 2}.get(st.session_state.get("ai_report_mode", "standard"), 1),
+            key="ai_report_mode_label",
+        )
+        mode_map = {"요약": "brief", "Brief": "brief", "표준": "standard", "Standard": "standard", "상세": "detailed", "Detailed": "detailed"}
+        mode = mode_map.get(mode_label, "standard")
+        st.session_state.ai_report_mode = mode
+
+        ai_memo = st.text_area(
+            t("AI 리서치 메모 / 외부정보", "AI memo / external info"),
+            value=st.session_state.get("_ai_memo_cache", pend.get("ai_memo", "")),
+            placeholder=t("상대전적·순위·라인업·부상·뉴스 링크를 붙여넣으세요", "Paste H2H, standings, lineup, injuries, news links"),
+            height=96,
+            key="ai_tab_memo",
+        )
+        bk_memo = st.text_input(
+            t("외부배당 메모", "Bookmaker memo"),
+            value=st.session_state.get("_ai_bk_cache", pend.get("bookmaker_memo", "")),
+            placeholder=t("예: Pinnacle T1 -180, Bet365 Gen.G 1.55", "e.g. Pinnacle T1 -180, Bet365 Gen.G 1.55"),
+            key="ai_tab_bk_memo",
+        )
+
+        mkey = f"{pend.get('token_id','')}|{mode}|{ai_memo.strip()}|{bk_memo.strip()}|{fair_price}|{edge}"
+        c1, c2 = st.columns([1, 1])
+        gen = c1.button(t("AI 리포트 생성", "Generate report"), use_container_width=True, key="ai_generate_report")
+        force = c2.button(t("새로 생성", "Force refresh"), use_container_width=True, key="ai_force_report")
+
+        if gen or force:
+            st.session_state._ai_memo_cache = ai_memo
+            st.session_state._ai_bk_cache = bk_memo
+            cache = st.session_state.ai_report_cache
+            if (not force) and mkey in cache:
+                st.session_state.ai_text = cache[mkey]
+                st.session_state.ai_error = ""
+            else:
+                prompt = build_prompt(
+                    market_name=q,
+                    outcome=o,
+                    current_price=current_price,
+                    category=category,
+                    sub=subcategory,
+                    ai_context=ai_memo,
+                    bookmaker_memo=bk_memo,
+                    bookmaker_prob=pend.get("bookmaker_prob", 0.0),
+                    fair_price=fair_price,
+                    edge=edge,
+                    market_class=pend.get("market_class", ""),
+                    report_mode=mode,
+                )
+                try:
+                    with st.spinner(t("AI 분석 중", "Analyzing")):
+                        txt, err = call_claude(prompt, mode=mode)
+                except Exception as e:
+                    txt, err = None, str(e)
+                st.session_state.ai_text = txt or ""
+                st.session_state.ai_error = err or ""
+                if txt:
+                    cache[mkey] = txt
+            st.session_state.ai_last_market_key = mkey
+
+        if st.session_state.get("ai_text"):
+            render_ai_report_json(st.session_state.ai_text)
+        elif st.session_state.get("ai_error"):
+            st.markdown(line(t("AI 일시 실패 — 새로 생성을 눌러주세요.", "AI failed — press Force refresh."), "w"), unsafe_allow_html=True)
+
 with tab_pf:
     st.markdown(f'<div class="headline">{t("포트폴리오", "Portfolio")}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="subline">{t("먼저 현재 보유 포지션을 판단하고, 그 다음 전체 자산과 성과를 확인합니다.", "Review open holdings first, then check overall assets and performance.")}</div>', unsafe_allow_html=True)
