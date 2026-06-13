@@ -205,9 +205,20 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 26px 0; }
 .ai-report-card { border: 1px solid var(--hairline); border-radius: 16px; padding: 16px; background:#fff; }
 .ai-report-card .a-key { font-size: 12px; font-weight: 700; color: var(--gray); letter-spacing: .05em; text-transform: uppercase; }
 .ai-report-card .a-body { margin-top: 8px; font-size: 14px; line-height: 1.65; color: var(--ink2); }
+
+.rc-grid { display:grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 12px; }
+.rc-card, .rc-action { border: 1px solid var(--hairline); border-radius: 16px; padding: 16px; background:#fff; }
+.rc-action { background: var(--fill); margin-top: 12px; }
+.rc-h { font-size: 12px; font-weight: 700; color: var(--gray); letter-spacing:.05em; text-transform: uppercase; margin-bottom: 8px; }
+.rc-row { display:flex; justify-content:space-between; gap: 14px; border-top: 1px solid var(--hairline); padding: 8px 0; font-size: 13.5px; }
+.rc-row:first-of-type { border-top: none; }
+.rc-k { color: var(--gray); flex: 0 0 34%; }
+.rc-v { color: var(--ink2); text-align:right; flex:1; }
+.rc-note { font-size: 14px; line-height: 1.65; color: var(--ink2); }
+.rc-missing { margin-top: 12px; border: 1px dashed var(--hairline); border-radius: 16px; padding: 14px; color: var(--gray); font-size: 13px; line-height: 1.6; background:#fff; }
 @media (max-width: 880px) {
   .profile-grid { grid-template-columns: repeat(2, 1fr); }
-  .ai-report-grid { grid-template-columns: 1fr; }
+  .ai-report-grid, .rc-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 880px) {
   .pf-grid { grid-template-columns: 1fr; }
@@ -684,75 +695,87 @@ def get_api_key():
     return None
 
 def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category="", market_name="", subcategory=""):
-    """Category-aware Claude report prompt for broad Polymarket markets."""
-    lang_line = "한국어로 답변해주세요." if st.session_state.lang == "ko" else "Answer in English."
+    """Strict JSON Claude prompt for clean report-card rendering.
+    Kept compatible with existing call sites.
+    """
+    lang = "ko" if st.session_state.lang == "ko" else "en"
     category = str(category or t("기타", "Other")).strip()
     subcategory = str(subcategory or "").strip()
     market_name = str(market_name or "").strip() or (f"{team_a} vs {team_b}" if str(team_b).strip() else str(team_a).strip())
+    current_price = float(current_price or 0)
+    fair_price = float(fair_price or current_price)
     edge = fair_price - current_price
-    cat_low = f"{category} {subcategory} {league}".lower()
+    cat_low = f"{category} {subcategory} {league} {market_name}".lower()
 
-    if any(x in cat_low for x in ["e스포츠", "esports", "lol", "valorant", "cs", "dota", "lck", "lpl"]):
-        category_hint = """시장 유형: e스포츠.
-분석 초점: 팀 전력, 최근 폼, 로스터/패치 변수, 대회 중요도, 경기 전 가격 변동성, 배당 괴리.
-최신 전적·로스터·패치 정보가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
-    elif any(x in cat_low for x in ["일반 스포츠", "스포츠", "sports", "tennis", "football", "soccer", "baseball", "basketball", "ufc", "축구", "야구", "농구", "테니스", "격투", "mma"]):
-        category_hint = """시장 유형: 일반 스포츠.
-분석 초점: 선수/팀 폼, 부상·라인업, 일정/피로도, 매치업, 북메이커 배당과의 괴리, 라이브 변동성.
-최신 부상·라인업·전적 데이터가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
-    elif any(x in cat_low for x in ["정치", "politic", "election", "선거"]):
-        category_hint = """시장 유형: 정치/선거.
-분석 초점: resolution 기준, 여론조사 리스크, 후보/정당 변수, 일정, 개표·공식 결과 기준, 표본 오류.
-최신 여론조사·공식 정보가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
-    elif any(x in cat_low for x in ["뉴스", "news", "event", "이벤트"]):
-        category_hint = """시장 유형: 뉴스/이벤트.
-분석 초점: 조건문, resolution 기준, 발표 시점, 정보 선반영 여부, 유동성, 반대 시나리오.
-최신 뉴스가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
-    elif any(x in cat_low for x in ["크립토", "crypto", "bitcoin", "btc", "eth", "ethereum"]):
-        category_hint = """시장 유형: 크립토.
-분석 초점: 조건문, 만기 시점, 가격 기준 거래소, 변동성, 청산/뉴스 리스크, 유동성, 가격 왜곡.
-실시간 가격·뉴스가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+    if any(k in cat_low for k in ["e스포츠", "esports", "lol", "valorant", "cs", "dota", "lck", "lpl"]):
+        domain = "sports_esports"
+        domain_fields = ["matchup_notes", "volatility", "pregame_checks", "form_data_available"]
+    elif any(k in cat_low for k in ["일반 스포츠", "스포츠", "sports", "tennis", "football", "soccer", "baseball", "mlb", "nba", "basketball", "ufc", "축구", "야구", "농구", "테니스", "격투", "mma"]):
+        domain = "sports_esports"
+        domain_fields = ["matchup_notes", "volatility", "pregame_checks", "form_data_available"]
+    elif any(k in cat_low for k in ["정치", "politic", "election", "선거", "뉴스", "news", "event", "이벤트"]):
+        domain = "politics_news"
+        domain_fields = ["resolution_basis", "sentiment_risk", "time_risk"]
+    elif any(k in cat_low for k in ["크립토", "crypto", "bitcoin", "btc", "eth", "ethereum"]):
+        domain = "crypto"
+        domain_fields = ["liquidity", "price_distortion", "volatility"]
     else:
-        category_hint = """시장 유형: 기타 Polymarket 시장.
-분석 초점: 조건문, resolution 기준, 가격 왜곡, 유동성, 변동성, 정보 부족.
-제공되지 않은 사실은 만들지 말고 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+        domain = "other"
+        domain_fields = ["condition_definition", "liquidity", "resolution_basis"]
 
-    return f"""당신은 Polymarket prediction market 리스크 분석가입니다.
-LoL 전용 분석가처럼 행동하지 말고, 시장 유형에 맞는 짧은 보고서를 작성하세요.
-모르는 최신 정보·전적·뉴스·여론조사·실시간 가격은 절대 추측하지 말고 \"데이터 없음/직접 확인 필요\"라고 쓰세요.
-이 답변은 투자 조언이 아니라 리스크 점검용입니다.
+    last = st.session_state.get("last_entry", {}) if isinstance(st.session_state.get("last_entry", {}), dict) else {}
+    bankroll = last.get("bankroll", effective_bankroll())
+    ctx = {
+        "market_name": market_name,
+        "outcome_or_target": team_a,
+        "opponent_or_other_side": team_b,
+        "category": category,
+        "subcategory": subcategory,
+        "league_or_note": league,
+        "purpose": purpose,
+        "current_price_cent": current_price,
+        "fair_price_cent": fair_price,
+        "edge_cent": round(edge, 2),
+        "implied_probability": f"{current_price:.1f}%",
+        "stake": last.get("stake"),
+        "bankroll": bankroll,
+        "position_pct": last.get("position_pct"),
+        "risk_score": last.get("final_score"),
+        "recommended_cap": last.get("rec_cap"),
+        "decision_from_app": last.get("decision"),
+        "portfolio_count": len(st.session_state.get("portfolio", [])),
+        "auto_trade_count": len(st.session_state.get("auto_trades", [])),
+        "domain": domain,
+        "required_context_fields": domain_fields,
+    }
+    lang_line = "모든 문자열 값은 한국어로 작성." if lang == "ko" else "All string values in English."
+    schema = {
+        "verdict": "enter|wait|avoid|trim|hold",
+        "verdict_label": "short phrase",
+        "executive_summary": "2-3 sentences",
+        "market_context": {k: "string" for k in domain_fields},
+        "price_edge": {"assessment": "cheap|fair|expensive", "reasoning": "1-2 sentences", "implied_prob": "%"},
+        "risk_matrix": ["risk 1", "risk 2", "risk 3"],
+        "portfolio_impact": "2 sentences using stake/bankroll/position_pct if present",
+        "action_plan": {"action": "enter|wait|avoid|trim|hold", "max_size": "$ or %", "invalidation": "condition that voids thesis"},
+        "confidence": {"level": "high|medium|low", "basis": "why"},
+        "missing_data": ["only unknown items here; [] if none"]
+    }
+    return f"""You are a Polymarket prediction-market analyst.
+Return ONLY valid minified JSON. No markdown. No code fences. No prose outside JSON.
 
-시장명: {market_name}
-카테고리: {category}
-세부종목/분류: {subcategory}
-리그/메모: {league}
-대상 A: {team_a}
-대상 B: {team_b}
-현재 Polymarket 가격: {current_price}¢
-사용자 적정가 추정: {fair_price}¢
-가격 차이: {edge:+.1f}¢
-배팅 목적: {purpose}
+INPUT={json.dumps(ctx, ensure_ascii=False)}
 
-{category_hint}
+JSON_SCHEMA={json.dumps(schema, ensure_ascii=False)}
 
-참고용 내 계정 상태:
-- 현재 기준 총자산: {money(effective_bankroll())}
-- 보유 포지션 수: {len(st.session_state.get("portfolio", []))}
-- 자동 거래내역 수: {len(st.session_state.get("auto_trades", []))}
-- 적정 단일 배팅 비율: {profile().get("max_pct", 3):.1f}%
-- 감정 한도: {money(profile().get("emotional_limit", 50))}
-
-반드시 아래 6개 섹션 제목을 그대로 사용하세요. 각 섹션은 2문장 이내로 짧게.
-1. 핵심 요약
-2. 주요 리스크
-3. 가격 판단
-4. 포트폴리오 영향
-5. 진입/관망 의견
-6. 신뢰도·부족 데이터
-
-마지막 줄은 반드시 이 형식으로 쓰세요:
-결론: 배팅 추천 / 비추천 / 중립
-{lang_line}"""
+RULES:
+- Unknown or unavailable live info must appear ONLY in missing_data.
+- Do not repeat '데이터 없음' outside missing_data.
+- Do not invent live scores, recent results, injuries, lineups, news, polls, or prices.
+- Use current_price/fair_price/edge/risk_score/recommended_cap from INPUT for price and action logic.
+- Action must be practical: enter/wait/avoid/trim/hold, max_size, invalidation.
+- {lang_line}
+"""
 
 def call_claude(prompt):
     key = get_api_key()
@@ -776,8 +799,8 @@ def call_claude(prompt):
     except Exception as e:
         return None, str(e)
 
-def render_ai_report(text):
-    """Render Claude output as a compact six-section report."""
+def render_ai_report_text(text):
+    """Fallback renderer for non-JSON Claude output."""
     raw_lines = [l.strip() for l in str(text or "").strip().split("\n") if l.strip()]
     if not raw_lines:
         return
@@ -832,8 +855,102 @@ def render_ai_report(text):
     st.markdown('<div class="ai-report-grid">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
 
 
+
+
+
+def safe_json_parse(text):
+    if not text:
+        return None
+    s = str(text).strip()
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+        if s.lower().startswith("json"):
+            s = s[4:].strip()
+    a, b = s.find("{"), s.rfind("}")
+    if a == -1 or b == -1 or b <= a:
+        return None
+    try:
+        return json.loads(s[a:b + 1])
+    except Exception:
+        return None
+
+
+def render_ai_report_json(text):
+    d = safe_json_parse(text)
+    if not d:
+        return render_ai_report_text(text)
+
+    vk = {"enter": "g", "hold": "g", "wait": "w", "trim": "w", "avoid": "b"}.get(str(d.get("verdict", "")).lower(), "i")
+    label = d.get("verdict_label") or d.get("verdict") or t("AI 판단", "AI verdict")
+    summary = d.get("executive_summary", "")
+    st.markdown(
+        f'<div class="verdict" style="border-top:none;padding-top:6px;">'
+        f'<div class="v-title" style="font-size:28px;"><span class="dot {vk}"></span>{esc(label)}</div>'
+        f'<div class="v-sub">{esc(summary)}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    pe = d.get("price_edge", {}) or {}
+    ctx = d.get("market_context", {}) or {}
+    ctx_html = "".join(
+        f'<div class="rc-row"><span class="rc-k">{esc(k)}</span><span class="rc-v">{esc(v)}</span></div>'
+        for k, v in ctx.items()
+    ) or f'<div class="rc-note">{t("시장 맥락 데이터 없음", "No context data")}</div>'
+
+    st.markdown(
+        '<div class="rc-grid">'
+        f'<div class="rc-card"><div class="rc-h">{t("가격·엣지", "Price · edge")}</div>'
+        f'<div class="rc-row"><span class="rc-k">{t("평가", "Assess")}</span><span class="rc-v">{esc(pe.get("assessment", "—"))}</span></div>'
+        f'<div class="rc-row"><span class="rc-k">implied</span><span class="rc-v">{esc(pe.get("implied_prob", "—"))}</span></div>'
+        f'<div class="rc-note">{esc(pe.get("reasoning", ""))}</div></div>'
+        f'<div class="rc-card"><div class="rc-h">{t("시장 맥락", "Context")}</div>{ctx_html}</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    risks = d.get("risk_matrix", []) or []
+    if risks:
+        st.markdown(
+            f'<div class="rc-h" style="margin-top:14px;">{t("주요 리스크", "Key risks")}</div>'
+            + "".join(line(esc(x), "w") for x in risks),
+            unsafe_allow_html=True,
+        )
+
+    if d.get("portfolio_impact"):
+        st.markdown(
+            f'<div class="rc-card" style="margin-top:12px;"><div class="rc-h">{t("포트폴리오 영향", "Portfolio impact")}</div>'
+            f'<div class="rc-note">{esc(d.get("portfolio_impact", ""))}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    ap = d.get("action_plan", {}) or {}
+    st.markdown(
+        f'<div class="rc-action"><div class="rc-h">{t("행동 계획", "Action plan")}</div>'
+        f'<div class="rc-row"><span class="rc-k">{t("행동", "Action")}</span><span class="rc-v"><b>{esc(ap.get("action", "—"))}</b></span></div>'
+        f'<div class="rc-row"><span class="rc-k">{t("최대 크기", "Max size")}</span><span class="rc-v">{esc(ap.get("max_size", "—"))}</span></div>'
+        f'<div class="rc-row"><span class="rc-k">{t("무효 조건", "Invalidation")}</span><span class="rc-v">{esc(ap.get("invalidation", "—"))}</span></div></div>',
+        unsafe_allow_html=True,
+    )
+
+    cf = d.get("confidence", {}) or {}
+    ck = {"high": "g", "medium": "w", "low": "b"}.get(str(cf.get("level", "")).lower(), "i")
+    st.markdown(
+        f'<div style="margin-top:12px;"><span class="state {ck}">{t("신뢰도", "Confidence")}: {esc(cf.get("level", "—"))}</span> '
+        f'<span class="rc-note">{esc(cf.get("basis", ""))}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    md = d.get("missing_data", []) or []
+    if md:
+        st.markdown(
+            f'<div class="rc-missing"><div class="rc-h">{t("확인 필요 데이터", "Verify manually")}</div>'
+            + "".join(f"<div>· {esc(x)}</div>" for x in md) + "</div>",
+            unsafe_allow_html=True,
+        )
+
+
 def render_ai(text):
-    render_ai_report(text)
+    render_ai_report_json(text)
 
 
 # =====================================================
