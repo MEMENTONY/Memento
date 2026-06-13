@@ -275,6 +275,10 @@ DEFAULTS = {
     "explore_markets": [],
     "explore_raw": [],
     "explore_url": "https://polymarket.com/event/",
+    "entry_url": "",
+    "entry_markets": [],
+    "entry_raw": [],
+    "_entry_active": "",
     "_explorer_active": "",
     "prefill_entry": {},
     "explore_ai_text": "", "explore_ai_error": "", "explore_ai_prompt": "", "explore_ai_pair": "",
@@ -2116,155 +2120,238 @@ def render_position_result(r):
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+
+
+def safe_float(v, default=50.0, lo=None, hi=None):
+    try:
+        if v is None or v == "":
+            out = float(default)
+        else:
+            out = float(v)
+    except Exception:
+        out = float(default)
+    if lo is not None:
+        out = max(float(lo), out)
+    if hi is not None:
+        out = min(float(hi), out)
+    return out
+
+
+def analyze_entry_url_row(row, stake, fair_price, confidence, purpose, category=None, subcategory=None, advanced=None):
+    """Run Entry verdict + Claude JSON report from a fetched Polymarket row.
+    Does not mutate widget-bound keys.
+    """
+    advanced = advanced or {}
+    name = row_get(row, "시장", "Market", "Unknown") or "Unknown"
+    outcome = row_get(row, "선택지", "Outcome", "Yes") or "Yes"
+    token = str(row.get("token_id", "") or "")
+    raw_price = row_get(row, "현재가 (¢)", "Price (¢)", None)
+    price = safe_float(raw_price, 50.0, 1.0, 99.0)
+    bankroll = effective_bankroll() or profile().get("assets", 1000.0) or 1000.0
+    fair_price = safe_float(fair_price, min(price + 5, 99), 1.0, 99.0)
+    stake = safe_float(stake, min(50.0, bankroll * 0.03), 1.0, None)
+    category = category or infer_market_category(st.session_state.get("entry_url", ""), name)
+    subcategory = subcategory or infer_market_subcategory(st.session_state.get("entry_url", ""), name)
+    target_price = safe_float(advanced.get("target_price"), min(price + 10, 99), 1.0, 100.0)
+    stop_price = safe_float(advanced.get("stop_price"), max(price - 10, 1), 0.0, 99.0)
+    market_type = advanced.get("market_type") or "Match Moneyline"
+    data = dict(
+        market_name=f"{name} — {outcome}",
+        team_a=outcome,
+        team_b="",
+        league=st.session_state.get("entry_url", "Polymarket URL") or "Polymarket URL",
+        category=category,
+        subcategory=subcategory,
+        current_price=price,
+        fair_price=fair_price,
+        stake=stake,
+        purpose=purpose,
+        market_type=market_type,
+        bankroll=bankroll,
+        confidence=confidence,
+        target_price=target_price,
+        stop_price=stop_price,
+        bookmaker_prob=safe_float(advanced.get("bookmaker_prob"), 0.0, 0.0, 99.0),
+        previous_good_price=safe_float(advanced.get("previous_good_price"), 0.0, 0.0, 99.0),
+        duplicate_ml=safe_float(advanced.get("duplicate_ml"), 0.0, 0.0, None),
+        duplicate_game=safe_float(advanced.get("duplicate_game"), 0.0, 0.0, None),
+        duplicate_side=safe_float(advanced.get("duplicate_side"), 0.0, 0.0, None),
+        fomo_count=int(advanced.get("fomo_count", 0) or 0),
+    )
+    st.session_state.prefill_entry = {
+        "market_name": f"{name} — {outcome}",
+        "outcome": outcome,
+        "opponent": "",
+        "current_price": price,
+        "fair_price": fair_price,
+        "category": category,
+        "subcategory": subcategory,
+        "note": f"token_id: {token[:16]}…" if token else "Polymarket URL",
+        "token_id": token,
+        "stake": stake,
+    }
+    result = calculate_entry(data)
+    st.session_state.last_entry = result
+    prompt = build_prompt(
+        outcome or name,
+        "",
+        "Polymarket URL",
+        price,
+        fair_price,
+        purpose,
+        category,
+        name,
+        subcategory,
+    )
+    prompt += (
+        f"\n\nADDITIONAL_APP_CONTEXT="
+        + json.dumps({
+            "url": st.session_state.get("entry_url", ""),
+            "market": name,
+            "outcome": outcome,
+            "token_id": token,
+            "app_decision": result.get("decision"),
+            "final_score": result.get("final_score"),
+            "value_score": result.get("value_score"),
+            "recommended_cap": result.get("rec_cap"),
+            "stake": stake,
+            "bankroll": bankroll,
+            "position_pct": result.get("position_pct"),
+        }, ensure_ascii=False)
+    )
+    st.session_state.ai_prompt = prompt
+    st.session_state.ai_pair = f"{name} · {outcome}"
+    try:
+        text, err = call_claude(prompt)
+    except Exception as e:
+        text, err = None, str(e)
+    st.session_state.ai_text = text or ""
+    st.session_state.ai_error = err or ""
+    return result
+
 # =====================================================
 # Tab 1 — Entry
 # =====================================================
 with tab1:
-    left, right = st.columns([1.05, 0.95], gap="large")
+    st.markdown(f'<div class="headline">{t("진입 판독", "Entry check")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="subline">{t("Polymarket URL을 넣으면 시장을 불러오고, 선택지별 판정과 AI 보고서를 한 번에 실행합니다.", "Paste a Polymarket URL, load outcomes, then run verdict + AI report in one flow.")}</div>', unsafe_allow_html=True)
 
-    with right:
-        st.markdown(f'<div class="eyebrow" style="margin-top:8px;">{t("입력", "Input")}</div>', unsafe_allow_html=True)
-        eb = effective_bankroll()
-        prefill = st.session_state.get("prefill_entry", {}) if isinstance(st.session_state.get("prefill_entry", {}), dict) else {}
-        if prefill:
-            st.markdown(line(t("시장 탐색에서 가져온 값이 입력칸에 반영되었습니다. 필요한 값만 조정하세요.", "Values from Market explorer are prefilled. Adjust anything you need."), "g"), unsafe_allow_html=True)
+    url_col, btn_col = st.columns([4, 1])
+    with url_col:
+        entry_url_val = st.text_input("Polymarket URL", value=st.session_state.get("entry_url", ""), key="entry_url_input")
+    with btn_col:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        load_entry_market = st.button(t("시장 불러오기", "Load market"), use_container_width=True, key="entry_load_market")
 
-        with st.form("entry_form"):
-            # Important: do NOT bind these widgets to keys that market-explorer later mutates.
-            # Streamlit raises StreamlitAPIException if a rendered widget key is modified in the same run.
-            market_name = st.text_input(
-                t("시장 이름", "Market name"),
-                value=prefill.get("market_name", t("예: T1 vs HLE — Match Winner", "Ex: T1 vs HLE — Match Winner"))
-            )
-
-            category_options = [t("e스포츠", "Esports"), t("일반 스포츠", "Sports"), t("정치", "Politics"),
-                 t("뉴스·이벤트", "News / events"), t("크립토", "Crypto"), t("기타", "Other")]
-            pref_cat = prefill.get("category", category_options[-1])
-            if pref_cat not in category_options:
-                pref_cat = category_options[-1]
-            category = st.selectbox(
-                t("시장 카테고리", "Market category"),
-                category_options,
-                index=category_options.index(pref_cat)
-            )
-            cat_ko = category if st.session_state.lang == "ko" else {
-                "Esports": "e스포츠", "Sports": "일반 스포츠", "Politics": "정치",
-                "News / events": "뉴스·이벤트", "Crypto": "크립토", "Other": "기타"
-            }.get(category, category)
-            sub_options = {
-                "e스포츠": ["LoL", "Valorant", "CS", "Dota", "기타 e스포츠"],
-                "일반 스포츠": ["테니스", "축구", "야구", "농구", "UFC/MMA", "기타 스포츠"],
-                "정치": ["선거", "정당/후보", "정책/법안", "기타 정치"],
-                "뉴스·이벤트": ["경제지표", "기업/인물", "국제뉴스", "기타 이벤트"],
-                "크립토": ["BTC", "ETH", "SOL", "기타 크립토"],
-                "기타": ["기타"]
-            }
-            sub_list = sub_options.get(cat_ko, [t("기타", "Other")])
-            pref_sub = prefill.get("subcategory", sub_list[0])
-            if pref_sub not in sub_list:
-                pref_sub = sub_list[0]
-            subcategory = st.selectbox(t("세부종목/분류", "Subcategory"), sub_list, index=sub_list.index(pref_sub))
-
-            is_match_market = cat_ko in ["e스포츠", "일반 스포츠"]
-            c0a, c0b = st.columns(2)
-            with c0a:
-                team_a = st.text_input(t("내가 보는 팀/선수", "My team/player") if is_match_market else t("대상/결과 A", "Target/outcome A"),
-                                       value=prefill.get("outcome", "T1" if is_match_market else "Yes"))
-            with c0b:
-                team_b = st.text_input(t("상대 팀/선수", "Opponent") if is_match_market else t("비교대상/결과 B (선택)", "Compare/outcome B optional"),
-                                       value=prefill.get("opponent", "HLE" if is_match_market else "No"))
-            league = st.text_input(t("리그/메모", "League / note"), value=prefill.get("note", "LCK" if cat_ko == "e스포츠" else subcategory))
-
-            c1, c2 = st.columns(2)
-            with c1:
-                current_price = st.number_input(t("현재가 (¢)", "Price (¢)"), 1.0, 99.0, float(prefill.get("current_price", 52.0)))
-                stake = st.number_input(t("투자금 ($)", "Stake ($)"), 1.0, value=50.0)
-            with c2:
-                fair_price = st.number_input(t("내 적정가 (¢)", "My fair price (¢)"), 1.0, 99.0, max(1.0, min(99.0, float(prefill.get("fair_price", 65.0)))))
-                confidence = st.selectbox(t("확신 수준", "Conviction"), confidence_options(), index=2)
-
-            c3, c4 = st.columns(2)
-            with c3: purpose = st.selectbox(t("배팅 목적", "Purpose"), purpose_options())
-            with c4: market_type = st.selectbox(t("시장 유형", "Market type"), market_type_options())
-
-            st.markdown(f'<div class="footnote" style="margin-top:4px;">{t(f"총자산 {money(eb)} · 감정 한도 {money(prof['emotional_limit'])} — 프로필 기준 자동 적용", f"Portfolio {money(eb)} · emotional cap {money(prof['emotional_limit'])} — applied from your profile")}</div>', unsafe_allow_html=True)
-
-            with st.expander(t("선택 입력 (목표가·손절가·중복·FOMO)", "Optional (target · stop · stacking · FOMO)")):
-                a, b = st.columns(2)
-                with a:
-                    target_price = st.number_input(t("목표가 (¢)", "Target (¢)"), 1.0, 100.0, 75.0)
-                    bookmaker_prob = st.number_input(t("북메이커 승률 (%)", "Bookmaker prob (%)"), 0.0, 99.0, 0.0)
-                with b:
-                    stop_price = st.number_input(t("손절가 (¢)", "Stop (¢)"), 0.0, 99.0, 40.0)
-                    previous_good_price = st.number_input(t("처음 봤던 가격 (¢)", "First-seen price (¢)"), 0.0, 99.0, 0.0)
-
-                st.markdown(f'<div class="eyebrow" style="margin-top:14px;">{t("중복 노출 ($)", "Stacked exposure ($)")}</div>', unsafe_allow_html=True)
-                d1, d2, d3 = st.columns(3)
-                with d1: duplicate_ml = st.number_input(t("같은 경기 ML", "Same-game ML"), 0.0, value=0.0)
-                with d2: duplicate_game = st.number_input("Game Winner", 0.0, value=0.0)
-                with d3: duplicate_side = st.number_input(t("같은 방향 추가", "Same side extra"), 0.0, value=0.0)
-
-                st.markdown(f'<div class="eyebrow" style="margin-top:14px;">{t("감정 · FOMO 체크", "Emotion · FOMO checks")}</div>', unsafe_allow_html=True)
-                fomo_options = [
-                    t("방금 큰 수익을 냈다", "Just made a big profit"),
-                    t("방금 큰 손실을 냈다", "Just took a big loss"),
-                    t("아까 판 게 후회된다", "Regret selling earlier"),
-                    t("빨리 복구하고 싶다", "Want to recover fast"),
-                    t("더 빨리 계좌를 키우고 싶다", "Want to grow faster"),
-                    t("놓치면 아깝다고 느낀다", "Afraid of missing out"),
-                    t("이미 같은 경기에 포지션이 있다", "Already in this game"),
-                ]
-                fomo_count = 0
-                f1c, f2c = st.columns(2)
-                for i, opt in enumerate(fomo_options):
-                    with f1c if i % 2 == 0 else f2c:
-                        if st.checkbox(opt, key=f"fomo_{i}"):
-                            fomo_count += 1
-
-            submitted = st.form_submit_button(t("판독하기", "Evaluate"), use_container_width=True)
-
-        if submitted:
-            data = dict(market_name=market_name, team_a=team_a, team_b=team_b, league=league,
-                        category=category, subcategory=subcategory,
-                        current_price=current_price, fair_price=fair_price, stake=stake,
-                        purpose=purpose, market_type=market_type, bankroll=eb,
-                        confidence=confidence, target_price=target_price, stop_price=stop_price,
-                        bookmaker_prob=bookmaker_prob, previous_good_price=previous_good_price,
-                        duplicate_ml=duplicate_ml, duplicate_game=duplicate_game,
-                        duplicate_side=duplicate_side, fomo_count=fomo_count)
-            st.session_state.last_entry = calculate_entry(data)
-            prompt = build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category, market_name, subcategory)
-            st.session_state.ai_prompt = prompt
-            st.session_state.ai_pair = f"{market_name} · {category} / {subcategory}"
-            with st.spinner(t("Claude가 시장을 분석하고 있습니다", "Claude is analyzing the market")):
-                text, err = call_claude(prompt)
-            st.session_state.ai_text = text or ""
-            st.session_state.ai_error = err or ""
-            st.rerun()
-
-        st.markdown(f'<div class="eyebrow" style="margin-top:26px;">{t("Claude 시장 분석", "Claude market analysis")}</div>', unsafe_allow_html=True)
-        if st.session_state.ai_text:
-            st.markdown(f'<div class="footnote" style="margin-bottom:4px;">{st.session_state.ai_pair}</div>', unsafe_allow_html=True)
-            render_ai(st.session_state.ai_text)
-        elif st.session_state.ai_error:
-            if st.session_state.ai_error == "no_key":
-                st.markdown(line(t("API 키가 없어 분석 프롬프트를 생성했습니다. Claude나 ChatGPT에 붙여넣으세요.", "No API key — paste this prompt into Claude or ChatGPT."), "w"), unsafe_allow_html=True)
-            elif st.session_state.ai_error.startswith("http_401"):
-                st.markdown(line(t("API 키 인증 실패 (401). Secrets의 ANTHROPIC_API_KEY 확인 후 Reboot 해주세요.", "Auth failed (401). Check ANTHROPIC_API_KEY and reboot."), "b"), unsafe_allow_html=True)
-            else:
-                st.markdown(line(t(f"분석 실패 ({st.session_state.ai_error}). 아래 프롬프트를 사용하세요.", f"Failed ({st.session_state.ai_error}). Use the prompt below."), "w"), unsafe_allow_html=True)
-            if st.session_state.ai_prompt:
-                st.code(st.session_state.ai_prompt)
+    if load_entry_market:
+        st.session_state.entry_url = entry_url_val
+        slug = extract_slug(entry_url_val)
+        if not slug:
+            st.markdown(line(t("URL에서 시장 slug를 찾지 못했습니다.", "Could not find market slug from URL."), "b"), unsafe_allow_html=True)
         else:
+            try:
+                with st.spinner(t("Polymarket 시장 정보를 불러오는 중", "Fetching Polymarket market data")):
+                    payload = fetch_gamma(slug)
+                    rows = extract_markets(payload)
+                st.session_state.entry_raw = payload
+                st.session_state.entry_markets = rows
+                if rows:
+                    st.markdown(line(t(f"{len(rows)}개 선택지를 불러왔습니다.", f"Loaded {len(rows)} outcomes."), "g"), unsafe_allow_html=True)
+                else:
+                    st.markdown(line(t("분석 가능한 선택지를 찾지 못했습니다.", "No analyzable outcomes found."), "w"), unsafe_allow_html=True)
+            except Exception as e:
+                st.session_state.entry_raw = {"error": str(e)}
+                st.session_state.entry_markets = []
+                st.markdown(line(t(f"시장 불러오기 실패 — {e}", f"Market fetch failed — {e}"), "b"), unsafe_allow_html=True)
+
+    rows = st.session_state.get("entry_markets", []) or []
+    if not rows:
+        st.markdown(
+            f"""<div class="quiet">
+<div class="q-title">{t('URL을 먼저 불러오세요', 'Load a URL first')}</div>
+<div class="q-body">{t('Polymarket 시장 URL을 붙여넣으면 승리/머니라인 계열 선택지를 카드로 보여줍니다.', 'Paste a Polymarket URL to show winner/moneyline outcomes as cards.')}</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        default_cat = infer_market_category(st.session_state.get("entry_url", ""), rows[0].get(t("시장", "Market"), ""))
+        default_sub = infer_market_subcategory(st.session_state.get("entry_url", ""), rows[0].get(t("시장", "Market"), ""))
+        top_l, top_r = st.columns([1, 1])
+        with top_l:
+            category_options = [t("e스포츠", "Esports"), t("일반 스포츠", "Sports"), t("정치", "Politics"), t("뉴스·이벤트", "News / events"), t("크립토", "Crypto"), t("기타", "Other")]
+            if default_cat not in category_options:
+                default_cat = category_options[-1]
+            entry_category = st.selectbox(t("시장 카테고리", "Market category"), category_options, index=category_options.index(default_cat), key="entry_url_category")
+        with top_r:
+            entry_subcategory = st.text_input(t("세부종목/분류", "Subcategory"), value=default_sub, key="entry_url_subcategory")
+
+        st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("분석할 선택지", "Outcomes to analyze")}</div>', unsafe_allow_html=True)
+        for i, row in enumerate(rows):
+            token = str(row.get("token_id", "") or "")
+            token_key = token if token else f"idx_{i}"
+            name = row_get(row, "시장", "Market", "Unknown")
+            outcome = row_get(row, "선택지", "Outcome", "")
+            raw_price = row_get(row, "현재가 (¢)", "Price (¢)", None)
+            price_f = safe_float(raw_price, 50.0, 1.0, 99.0)
+            clob = fetch_clob_price(token) if token else {"bid": None, "ask": None, "spread": None}
+            bid = clob.get("bid")
+            ask = clob.get("ask")
+            spread = clob.get("spread")
+
             st.markdown(
-                f"""<div class="quiet" style="padding:40px 20px;">
-<div class="q-title">{t("판독하면 자동으로 분석합니다", "Runs when you evaluate")}</div>
-<div class="q-body">{t("시장 구조, 리스크, 가격 판단,<br>포트폴리오 영향까지 AI가 정리합니다.", "Market structure, risk, price view,<br>and portfolio impact — by AI.")}</div>
-</div>""", unsafe_allow_html=True)
+                f"""<div class="market-card">
+<div class="market-head"><div><div class="market-title">{_escape(name)}</div><div class="market-sub">{t('선택지','Outcome')} · <b>{_escape(outcome)}</b></div></div><div class="market-price">{cents(price_f)}</div></div>
+<div class="market-metrics">
+<div class="market-metric"><div class="k">Best bid</div><div class="v">{cents(float(bid)) if isinstance(bid,(int,float)) else '—'}</div></div>
+<div class="market-metric"><div class="k">Best ask</div><div class="v">{cents(float(ask)) if isinstance(ask,(int,float)) else '—'}</div></div>
+<div class="market-metric"><div class="k">Spread</div><div class="v">{cents(float(spread)) if isinstance(spread,(int,float)) else '—'}</div></div>
+<div class="market-metric"><div class="k">Token</div><div class="v">{_escape(token[:8] + '…' if token else '—')}</div></div>
+</div>
+</div>""",
+                unsafe_allow_html=True,
+            )
 
-    with left:
-        render_entry_result(st.session_state.last_entry)
+            in1, in2, in3, in4 = st.columns([1, 1, 1, 1])
+            with in1:
+                stake_i = st.number_input(t("투자금 ($)", "Stake ($)"), 1.0, value=float(min(50.0, (effective_bankroll() or 1000.0) * 0.03)), key=f"entry_stake_{i}_{token_key}")
+            with in2:
+                fair_i = st.number_input(t("내 적정가 (¢)", "My fair price (¢)"), 1.0, 99.0, value=float(min(price_f + 5, 99.0)), key=f"entry_fair_{i}_{token_key}")
+            with in3:
+                conf_i = st.selectbox(t("확신", "Conviction"), confidence_options(), index=2, key=f"entry_conf_{i}_{token_key}")
+            with in4:
+                purpose_i = st.selectbox(t("목적", "Purpose"), purpose_options(), index=0, key=f"entry_purpose_{i}_{token_key}")
 
+            adv = {}
+            with st.expander(t("수동 입력 / 고급설정", "Manual override / advanced"), expanded=False):
+                adv_l, adv_r = st.columns(2)
+                with adv_l:
+                    adv["target_price"] = st.number_input(t("목표가 (¢)", "Target (¢)"), 1.0, 100.0, value=float(min(price_f + 10, 99.0)), key=f"entry_target_{i}_{token_key}")
+                    adv["bookmaker_prob"] = st.number_input(t("북메이커 승률 (%)", "Bookmaker prob (%)"), 0.0, 99.0, value=0.0, key=f"entry_book_{i}_{token_key}")
+                    mt_opts = market_type_options()
+                    adv["market_type"] = st.selectbox(t("시장 유형", "Market type"), mt_opts, index=0, key=f"entry_mt_{i}_{token_key}")
+                with adv_r:
+                    adv["stop_price"] = st.number_input(t("손절가 (¢)", "Stop (¢)"), 0.0, 99.0, value=float(max(price_f - 10, 1.0)), key=f"entry_stop_{i}_{token_key}")
+                    adv["previous_good_price"] = st.number_input(t("처음 봤던 가격 (¢)", "First-seen price (¢)"), 0.0, 99.0, value=0.0, key=f"entry_first_{i}_{token_key}")
+                    adv["duplicate_ml"] = st.number_input(t("기존 동일시장 노출 ($)", "Existing same-market exposure ($)"), 0.0, value=0.0, key=f"entry_dup_{i}_{token_key}")
+
+            if st.button(t("분석", "Analyze"), key=f"entry_analyze_{i}_{token_key}", use_container_width=True):
+                with st.spinner(t("판정과 AI 보고서를 생성하는 중", "Generating verdict and AI report")):
+                    analyze_entry_url_row(row, stake_i, fair_i, conf_i, purpose_i, entry_category, entry_subcategory, adv)
+                st.session_state._entry_active = f"{i}_{token_key}"
+                st.rerun()
+
+            active_key = f"{i}_{token_key}"
+            if st.session_state.get("_entry_active") == active_key and st.session_state.get("last_entry"):
+                render_entry_result(st.session_state.last_entry)
+                st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("AI 시장 보고서", "AI market report")}</div>', unsafe_allow_html=True)
+                if st.session_state.get("ai_text"):
+                    render_ai_report_json(st.session_state.ai_text)
+                elif st.session_state.get("ai_error"):
+                    st.markdown(line(t(f"AI 실패 ({st.session_state.ai_error})", f"AI failed ({st.session_state.ai_error})"), "w"), unsafe_allow_html=True)
+                    if st.session_state.get("ai_prompt"):
+                        st.code(st.session_state.ai_prompt)
+
+            st.markdown('<hr>', unsafe_allow_html=True)
 
 
 
@@ -2469,7 +2556,7 @@ with tab_explore:
                         unsafe_allow_html=True,
                     )
                     if st.session_state.get("explore_ai_text"):
-                        render_ai(st.session_state.explore_ai_text)
+                        render_ai_report_json(st.session_state.explore_ai_text)
                     elif st.session_state.get("explore_ai_error"):
                         st.markdown(line(t(f"AI 실패 ({st.session_state.explore_ai_error}) — 프롬프트를 확인하세요.", f"AI failed ({st.session_state.explore_ai_error}) — check prompt."), "w"), unsafe_allow_html=True)
                         if st.session_state.get("explore_ai_prompt"):
