@@ -188,6 +188,18 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 26px 0; }
 .profile-cell { border-top: 1px solid var(--hairline); padding-top: 12px; min-width: 0; }
 .profile-cell .k { font-size: 11.5px; color: var(--gray); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .profile-cell .v { margin-top: 5px; font-size: 19px; font-weight: 700; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+
+.market-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 10px 0 22px 0; }
+.market-card { border: 1px solid var(--hairline); border-radius: 18px; padding: 18px; background: #ffffff; box-shadow: 0 1px 2px rgba(0,0,0,.03); margin-bottom: 12px; }
+.market-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom: 12px; }
+.market-title { font-size: 15px; font-weight: 700; line-height: 1.35; letter-spacing: -.012em; color: var(--ink); }
+.market-sub { margin-top: 5px; font-size: 12.5px; color: var(--gray); line-height: 1.45; }
+.market-price { font-size: 28px; font-weight: 700; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+.market-metrics { display:grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 12px; }
+.market-metric { border-top: 1px solid var(--hairline); padding-top: 10px; min-width:0; }
+.market-metric .k { font-size: 11.5px; color: var(--gray); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.market-metric .v { margin-top: 4px; font-size: 13.5px; font-weight: 650; color: var(--ink2); font-variant-numeric: tabular-nums; }
+.market-note { font-size: 12.5px; color: var(--gray); line-height: 1.5; margin-top: 10px; }
 .profile-cell .v.pos { color: var(--green); } .profile-cell .v.neg { color: var(--red); }
 .ai-report-grid { display:grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 12px; }
 .ai-report-card { border: 1px solid var(--hairline); border-radius: 16px; padding: 16px; background:#fff; }
@@ -249,6 +261,11 @@ DEFAULTS = {
     "adj_month": 0.0,          # pre-app P&L adjustments
     "adj_year": 0.0,
     "url_rows": [],
+    "explore_markets": [],
+    "explore_raw": [],
+    "explore_url": "https://polymarket.com/event/",
+    "prefill_entry": {},
+    "explore_ai_text": "", "explore_ai_error": "", "explore_ai_prompt": "", "explore_ai_pair": "",
     "ai_text": "", "ai_error": "", "ai_prompt": "", "ai_pair": "",
     "wallet_raw": [],
     "activity_raw": [],
@@ -839,6 +856,105 @@ def extract_markets(payload):
                              t("현재가 (¢)", "Price (¢)"): price,
                              "token_id": tokens[i] if i < len(tokens) else ""})
     return rows
+
+
+def _escape(v):
+    return html.escape(str(v or ""))
+
+
+def _as_cents(v):
+    try:
+        f = float(v)
+        return f * 100 if 0 <= f <= 1 else f
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_clob_price(token_id):
+    """Read-only CLOB quote. Public endpoint; no trading/auth."""
+    token_id = str(token_id or "").strip()
+    if not token_id:
+        return {"bid": None, "ask": None, "spread": None, "raw": {}}
+
+    out = {"bid": None, "ask": None, "spread": None, "raw": {}}
+
+    def _get(path, params):
+        url = "https://clob.polymarket.com" + path + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": "Memento/5.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    try:
+        bid_raw = _get("/price", {"token_id": token_id, "side": "BUY"})
+        out["raw"]["bid"] = bid_raw
+        out["bid"] = _as_cents(bid_raw.get("price") if isinstance(bid_raw, dict) else None)
+    except Exception as e:
+        out["raw"]["bid_error"] = str(e)
+
+    try:
+        ask_raw = _get("/price", {"token_id": token_id, "side": "SELL"})
+        out["raw"]["ask"] = ask_raw
+        out["ask"] = _as_cents(ask_raw.get("price") if isinstance(ask_raw, dict) else None)
+    except Exception as e:
+        out["raw"]["ask_error"] = str(e)
+
+    try:
+        sp_raw = _get("/spread", {"token_id": token_id})
+        out["raw"]["spread"] = sp_raw
+        out["spread"] = _as_cents(sp_raw.get("spread") if isinstance(sp_raw, dict) else None)
+    except Exception as e:
+        out["raw"]["spread_error"] = str(e)
+
+    if out["spread"] is None and out["bid"] is not None and out["ask"] is not None:
+        out["spread"] = out["ask"] - out["bid"]
+    return out
+
+
+def row_get(row, ko, en=None, default=""):
+    if not isinstance(row, dict):
+        return default
+    if ko in row:
+        return row.get(ko, default)
+    if en and en in row:
+        return row.get(en, default)
+    lookup = ("시장", "Market") if ko == "시장" else ("선택지", "Outcome") if ko == "선택지" else ("현재가 (¢)", "Price (¢)")
+    for k in lookup:
+        if k in row:
+            return row.get(k, default)
+    return row.get(ko, default)
+
+
+def market_card_html(row, clob=None):
+    name = row_get(row, "시장", "Market", "Unknown")
+    outcome = row_get(row, "선택지", "Outcome", "")
+    price = row_get(row, "현재가 (¢)", "Price (¢)", None)
+    token = row.get("token_id", "") if isinstance(row, dict) else ""
+    clob = clob or {}
+    bid = clob.get("bid")
+    ask = clob.get("ask")
+    spread = clob.get("spread")
+    price_text = cents(float(price)) if isinstance(price, (int, float)) else "—"
+    bid_text = cents(float(bid)) if isinstance(bid, (int, float)) else "—"
+    ask_text = cents(float(ask)) if isinstance(ask, (int, float)) else "—"
+    spread_text = cents(float(spread)) if isinstance(spread, (int, float)) else "—"
+    token_short = str(token)[:8] + "…" if token else "—"
+    return f"""<div class="market-card">
+  <div class="market-head">
+    <div>
+      <div class="market-title">{_escape(name)}</div>
+      <div class="market-sub">{t('선택지', 'Outcome')} · <b>{_escape(outcome)}</b></div>
+    </div>
+    <div class="market-price">{price_text}</div>
+  </div>
+  <div class="market-metrics">
+    <div class="market-metric"><div class="k">Best bid</div><div class="v">{bid_text}</div></div>
+    <div class="market-metric"><div class="k">Best ask</div><div class="v">{ask_text}</div></div>
+    <div class="market-metric"><div class="k">Spread</div><div class="v">{spread_text}</div></div>
+    <div class="market-metric"><div class="k">Token</div><div class="v">{_escape(token_short)}</div></div>
+  </div>
+  <div class="market-note">{t('원본 가격과 CLOB 호가가 소폭 다를 수 있습니다. 실제 주문은 Polymarket에서 확인하세요.', 'Gamma prices and CLOB quotes can differ slightly. Confirm orders on Polymarket.')}</div>
+</div>"""
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_wallet_positions(addr):
@@ -1451,8 +1567,9 @@ st.markdown(
     f'{t("감정 한도", "cap")} {money(prof["emotional_limit"])}</div>',
     unsafe_allow_html=True)
 
-tab1, tab_pf, tab2, tab3, tab4, tab_set = st.tabs([
+tab1, tab_explore, tab_pf, tab2, tab3, tab4, tab_set = st.tabs([
     t("진입 판독", "Entry check"),
+    t("시장 탐색", "Market explorer"),
     t("포트폴리오", "Portfolio"),
     t("포지션 관리", "Positions"),
     t("부분매도", "Partial sell"),
@@ -1610,13 +1727,27 @@ with tab1:
     with right:
         st.markdown(f'<div class="eyebrow" style="margin-top:8px;">{t("입력", "Input")}</div>', unsafe_allow_html=True)
         eb = effective_bankroll()
-        with st.form("entry_form"):
-            market_name = st.text_input(t("시장 이름", "Market name"), t("예: T1 vs HLE — Match Winner", "Ex: T1 vs HLE — Match Winner"))
+        prefill = st.session_state.get("prefill_entry", {}) if isinstance(st.session_state.get("prefill_entry", {}), dict) else {}
+        if prefill:
+            st.markdown(line(t("시장 탐색에서 가져온 값이 입력칸에 반영되었습니다. 필요한 값만 조정하세요.", "Values from Market explorer are prefilled. Adjust anything you need."), "g"), unsafe_allow_html=True)
 
+        with st.form("entry_form"):
+            market_name = st.text_input(
+                t("시장 이름", "Market name"),
+                value=st.session_state.get("entry_market_name", prefill.get("market_name", t("예: T1 vs HLE — Match Winner", "Ex: T1 vs HLE — Match Winner"))),
+                key="entry_market_name"
+            )
+
+            category_options = [t("e스포츠", "Esports"), t("일반 스포츠", "Sports"), t("정치", "Politics"),
+                 t("뉴스·이벤트", "News / events"), t("크립토", "Crypto"), t("기타", "Other")]
+            pref_cat = st.session_state.get("entry_category", prefill.get("category", category_options[-1]))
+            if pref_cat not in category_options:
+                pref_cat = category_options[-1]
             category = st.selectbox(
                 t("시장 카테고리", "Market category"),
-                [t("e스포츠", "Esports"), t("일반 스포츠", "Sports"), t("정치", "Politics"),
-                 t("뉴스·이벤트", "News / events"), t("크립토", "Crypto"), t("기타", "Other")],
+                category_options,
+                index=category_options.index(pref_cat),
+                key="entry_category"
             )
             cat_ko = category if st.session_state.lang == "ko" else {
                 "Esports": "e스포츠", "Sports": "일반 스포츠", "Politics": "정치",
@@ -1630,22 +1761,28 @@ with tab1:
                 "크립토": ["BTC", "ETH", "SOL", "기타 크립토"],
                 "기타": ["기타"]
             }
-            subcategory = st.selectbox(t("세부종목/분류", "Subcategory"), sub_options.get(cat_ko, [t("기타", "Other")]))
+            sub_list = sub_options.get(cat_ko, [t("기타", "Other")])
+            pref_sub = st.session_state.get("entry_subcategory", prefill.get("subcategory", sub_list[0]))
+            if pref_sub not in sub_list:
+                pref_sub = sub_list[0]
+            subcategory = st.selectbox(t("세부종목/분류", "Subcategory"), sub_list, index=sub_list.index(pref_sub), key="entry_subcategory")
 
             is_match_market = cat_ko in ["e스포츠", "일반 스포츠"]
             c0a, c0b = st.columns(2)
             with c0a:
-                team_a = st.text_input(t("내가 보는 팀/선수", "My team/player") if is_match_market else t("대상/결과 A", "Target/outcome A"), "T1" if is_match_market else "Yes")
+                team_a = st.text_input(t("내가 보는 팀/선수", "My team/player") if is_match_market else t("대상/결과 A", "Target/outcome A"),
+                                       value=st.session_state.get("entry_team_a", prefill.get("outcome", "T1" if is_match_market else "Yes")), key="entry_team_a")
             with c0b:
-                team_b = st.text_input(t("상대 팀/선수", "Opponent") if is_match_market else t("비교대상/결과 B (선택)", "Compare/outcome B optional"), "HLE" if is_match_market else "No")
-            league = st.text_input(t("리그/메모", "League / note"), "LCK" if cat_ko == "e스포츠" else subcategory)
+                team_b = st.text_input(t("상대 팀/선수", "Opponent") if is_match_market else t("비교대상/결과 B (선택)", "Compare/outcome B optional"),
+                                       value=st.session_state.get("entry_team_b", "HLE" if is_match_market else "No"), key="entry_team_b")
+            league = st.text_input(t("리그/메모", "League / note"), value=st.session_state.get("entry_league", prefill.get("note", "LCK" if cat_ko == "e스포츠" else subcategory)), key="entry_league")
 
             c1, c2 = st.columns(2)
             with c1:
-                current_price = st.number_input(t("현재가 (¢)", "Price (¢)"), 1.0, 99.0, 52.0)
+                current_price = st.number_input(t("현재가 (¢)", "Price (¢)"), 1.0, 99.0, float(st.session_state.get("entry_current_price", prefill.get("current_price", 52.0))), key="entry_current_price")
                 stake = st.number_input(t("투자금 ($)", "Stake ($)"), 1.0, value=50.0)
             with c2:
-                fair_price = st.number_input(t("내 적정가 (¢)", "My fair price (¢)"), 1.0, 99.0, 65.0)
+                fair_price = st.number_input(t("내 적정가 (¢)", "My fair price (¢)"), 1.0, 99.0, max(1.0, min(99.0, float(st.session_state.get("entry_fair_price", prefill.get("fair_price", 65.0))))), key="entry_fair_price")
                 confidence = st.selectbox(t("확신 수준", "Conviction"), confidence_options(), index=2)
 
             c3, c4 = st.columns(2)
@@ -1730,6 +1867,108 @@ with tab1:
     with left:
         render_entry_result(st.session_state.last_entry)
 
+
+
+
+# =====================================================
+# Tab — Market explorer
+# =====================================================
+with tab_explore:
+    st.markdown(f'<div class="headline">{t("시장 탐색", "Market explorer")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="subline">{t("Polymarket URL을 붙여넣으면 시장 가격·토큰·호가를 불러오고, 원하는 선택지를 진입 판독으로 보낼 수 있습니다.", "Paste a Polymarket URL to view prices, tokens, quotes, and send an outcome to Entry check.")}</div>', unsafe_allow_html=True)
+
+    ex_left, ex_right = st.columns([1.2, 0.8], gap="large")
+    with ex_left:
+        url = st.text_input("Polymarket URL", value=st.session_state.explore_url, key="explore_url_input")
+        cfetch, cclear = st.columns([2, 1])
+        with cfetch:
+            fetch_clicked = st.button(t("시장 불러오기", "Fetch market"), use_container_width=True)
+        with cclear:
+            if st.button(t("초기화", "Clear"), use_container_width=True):
+                st.session_state.explore_markets = []
+                st.session_state.explore_raw = []
+                st.session_state.explore_ai_text = ""
+                st.session_state.explore_ai_error = ""
+                st.rerun()
+
+        if fetch_clicked:
+            st.session_state.explore_url = url
+            slug = extract_slug(url)
+            if not slug:
+                st.markdown(line(t("URL에서 slug를 찾지 못했습니다.", "Couldn't find a slug from the URL."), "b"), unsafe_allow_html=True)
+            else:
+                try:
+                    with st.spinner(t("Polymarket 시장 정보를 불러오는 중", "Fetching Polymarket market data")):
+                        payload = fetch_gamma(slug)
+                        rows = extract_markets(payload)
+                    st.session_state.explore_raw = payload
+                    st.session_state.explore_markets = rows
+                    if rows:
+                        st.markdown(line(t(f"{len(rows)}개 선택지를 불러왔습니다.", f"Loaded {len(rows)} outcomes."), "g"), unsafe_allow_html=True)
+                    else:
+                        st.markdown(line(t("선택지를 찾지 못했습니다. /event/ URL인지 확인하세요.", "No outcomes found. Check that this is an /event/ URL."), "w"), unsafe_allow_html=True)
+                except Exception as e:
+                    st.session_state.explore_raw = {"error": str(e)}
+                    st.markdown(line(t(f"시장 정보 불러오기 실패 — {e}", f"Market fetch failed — {e}"), "b"), unsafe_allow_html=True)
+
+        rows = st.session_state.explore_markets or []
+        if not rows:
+            st.markdown(f"""<div class="quiet"><div class="q-title">{t('불러온 시장이 없습니다', 'No market loaded')}</div><div class="q-body">{t('Polymarket 시장 URL을 붙여넣고 시장 불러오기를 누르세요.', 'Paste a Polymarket market URL and press Fetch market.')}</div></div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="eyebrow">{t("시장 카드", "Market cards")}</div>', unsafe_allow_html=True)
+            for i, row in enumerate(rows):
+                token = str(row.get("token_id", "") or "")
+                clob = fetch_clob_price(token) if token else {"bid": None, "ask": None, "spread": None, "raw": {}}
+                st.markdown(market_card_html(row, clob), unsafe_allow_html=True)
+                b1, b2, b3 = st.columns([1.15, 1.15, 1])
+                name = row_get(row, "시장", "Market", "Unknown")
+                outcome = row_get(row, "선택지", "Outcome", "")
+                price = row_get(row, "현재가 (¢)", "Price (¢)", 52.0)
+                try:
+                    price_f = float(price)
+                except Exception:
+                    price_f = 52.0
+                with b1:
+                    if st.button(t("진입 판독으로 보내기", "Send to Entry"), key=f"send_entry_{i}_{token}", use_container_width=True):
+                        st.session_state.prefill_entry = {"market_name": name, "outcome": outcome, "current_price": max(1.0, min(99.0, price_f)), "fair_price": max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f)), "category": t("기타", "Other"), "subcategory": t("기타", "Other"), "note": f"token_id: {token[:16]}…" if token else "", "token_id": token}
+                        st.session_state.entry_market_name = name
+                        st.session_state.entry_team_a = outcome or "Yes"
+                        st.session_state.entry_team_b = "No"
+                        st.session_state.entry_current_price = max(1.0, min(99.0, price_f))
+                        st.session_state.entry_fair_price = max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f))
+                        st.session_state.entry_category = t("기타", "Other")
+                        st.session_state.entry_subcategory = t("기타", "Other")
+                        st.session_state.entry_league = f"token_id: {token[:16]}…" if token else "Polymarket URL"
+                        st.toast(t("진입 판독 탭에 값을 보냈습니다", "Sent values to Entry check"))
+                        st.rerun()
+                with b2:
+                    if st.button(t("AI 시장 보고서", "AI market report"), key=f"ai_report_{i}_{token}", use_container_width=True):
+                        prompt = build_prompt(outcome or name, "", "Polymarket URL", max(1.0, min(99.0, price_f)), max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f)), t("시장 탐색", "Market explorer"), t("기타", "Other"), name, t("기타", "Other"))
+                        st.session_state.explore_ai_prompt = prompt
+                        st.session_state.explore_ai_pair = f"{name} · {outcome}"
+                        with st.spinner(t("AI 보고서 생성 중", "Generating AI report")):
+                            text, err = call_claude(prompt)
+                        st.session_state.explore_ai_text = text or ""
+                        st.session_state.explore_ai_error = err or ""
+                        st.rerun()
+                with b3:
+                    st.link_button(t("원본 열기", "Open original"), url or "https://polymarket.com", use_container_width=True)
+
+            with st.expander(t("원본 시장 데이터", "Raw market data")):
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.json(st.session_state.explore_raw)
+
+    with ex_right:
+        st.markdown(f'<div class="eyebrow">{t("AI 시장 보고서", "AI market report")}</div>', unsafe_allow_html=True)
+        if st.session_state.explore_ai_text:
+            st.markdown(f'<div class="footnote" style="margin-bottom:4px;">{_escape(st.session_state.explore_ai_pair)}</div>', unsafe_allow_html=True)
+            render_ai(st.session_state.explore_ai_text)
+        elif st.session_state.explore_ai_error:
+            st.markdown(line(t(f"AI 보고서 실패 — {st.session_state.explore_ai_error}", f"AI report failed — {st.session_state.explore_ai_error}"), "w"), unsafe_allow_html=True)
+            if st.session_state.explore_ai_prompt:
+                st.code(st.session_state.explore_ai_prompt)
+        else:
+            st.markdown(f"""<div class="quiet"><div class="q-title">{t('보고서가 여기에 표시됩니다', 'Report appears here')}</div><div class="q-body">{t('시장 카드에서 AI 시장 보고서를 누르세요.', 'Press AI market report on a market card.')}</div></div>""", unsafe_allow_html=True)
 
 # =====================================================
 # Tab 2 — Position
@@ -2264,6 +2503,8 @@ with tab_set:
                   "auto_trades": st.session_state.auto_trades, "wallet_addr": st.session_state.wallet_addr,
                   "imported_tx_ids": st.session_state.imported_tx_ids,
                   "pnl_raw": st.session_state.pnl_raw, "profile_pnl": st.session_state.profile_pnl,
+                  "explore_url": st.session_state.explore_url, "explore_markets": st.session_state.explore_markets,
+                  "prefill_entry": st.session_state.prefill_entry,
                   "adj_month": st.session_state.adj_month, "adj_year": st.session_state.adj_year,
                   "reviews": st.session_state.reviews}
         st.download_button(t("백업 내려받기 (JSON)", "Download backup (JSON)"),
