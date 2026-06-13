@@ -224,9 +224,21 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 26px 0; }
 # =====================================================
 # State
 # =====================================================
+DEFAULT_PROFILE = {
+    "assets": 1000.0,
+    "start_capital": 1000.0,
+    "start_when": "자동 시작",
+    "freq": "",
+    "cats": [],
+    "emotional_limit": 50.0,
+    "max_pct": 3.0,
+    "block_pct": 12.0,
+    "loss_reaction": "기본값",
+}
+
 DEFAULTS = {
     "lang": "ko",
-    "profile": None,           # set by onboarding
+    "profile": dict(DEFAULT_PROFILE),  # default risk profile; no onboarding gate
     "last_entry": None,
     "last_position": None,
     "trade_log": [],
@@ -259,11 +271,12 @@ def t(ko, en):
 
 def profile():
     p = st.session_state.profile
-    if p:
-        return p
-    return {"assets": 1000.0, "start_capital": 1000.0, "start_when": "",
-            "freq": "", "cats": [], "emotional_limit": 50.0,
-            "max_pct": 3.0, "block_pct": 12.0, "loss_reaction": ""}
+    if isinstance(p, dict) and p:
+        merged = dict(DEFAULT_PROFILE)
+        merged.update(p)
+        return merged
+    st.session_state.profile = dict(DEFAULT_PROFILE)
+    return dict(DEFAULT_PROFILE)
 
 
 # =====================================================
@@ -647,18 +660,23 @@ def get_api_key():
             return k
     return None
 
-def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category="", market_name=""):
-    """Category-aware Claude report prompt for Polymarket markets."""
+def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category="", market_name="", subcategory=""):
+    """Category-aware Claude report prompt for broad Polymarket markets."""
     lang_line = "한국어로 답변해주세요." if st.session_state.lang == "ko" else "Answer in English."
-    category = str(category or t("기타", "Other"))
+    category = str(category or t("기타", "Other")).strip()
+    subcategory = str(subcategory or "").strip()
     market_name = str(market_name or "").strip() or (f"{team_a} vs {team_b}" if str(team_b).strip() else str(team_a).strip())
     edge = fair_price - current_price
-    cat_low = category.lower()
+    cat_low = f"{category} {subcategory} {league}".lower()
 
-    if any(x in cat_low for x in ["match", "game", "score", "sport", "sports", "winner", "esports", "lck", "lol", "moneyline"]):
-        category_hint = """시장 유형: 스포츠/경기형 또는 e스포츠.
-분석 초점: 팀/선수 전력, 부상·로스터, 최근 폼, 일정, 배당 괴리, 경기 전 가격 변동성.
-최신 전적·부상·라인업 데이터가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+    if any(x in cat_low for x in ["e스포츠", "esports", "lol", "valorant", "cs", "dota", "lck", "lpl"]):
+        category_hint = """시장 유형: e스포츠.
+분석 초점: 팀 전력, 최근 폼, 로스터/패치 변수, 대회 중요도, 경기 전 가격 변동성, 배당 괴리.
+최신 전적·로스터·패치 정보가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+    elif any(x in cat_low for x in ["일반 스포츠", "스포츠", "sports", "tennis", "football", "soccer", "baseball", "basketball", "ufc", "축구", "야구", "농구", "테니스", "격투", "mma"]):
+        category_hint = """시장 유형: 일반 스포츠.
+분석 초점: 선수/팀 폼, 부상·라인업, 일정/피로도, 매치업, 북메이커 배당과의 괴리, 라이브 변동성.
+최신 부상·라인업·전적 데이터가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
     elif any(x in cat_low for x in ["정치", "politic", "election", "선거"]):
         category_hint = """시장 유형: 정치/선거.
 분석 초점: resolution 기준, 여론조사 리스크, 후보/정당 변수, 일정, 개표·공식 결과 기준, 표본 오류.
@@ -667,6 +685,10 @@ def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, cat
         category_hint = """시장 유형: 뉴스/이벤트.
 분석 초점: 조건문, resolution 기준, 발표 시점, 정보 선반영 여부, 유동성, 반대 시나리오.
 최신 뉴스가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
+    elif any(x in cat_low for x in ["크립토", "crypto", "bitcoin", "btc", "eth", "ethereum"]):
+        category_hint = """시장 유형: 크립토.
+분석 초점: 조건문, 만기 시점, 가격 기준 거래소, 변동성, 청산/뉴스 리스크, 유동성, 가격 왜곡.
+실시간 가격·뉴스가 제공되지 않았으면 반드시 \"데이터 없음/직접 확인 필요\"라고 쓰세요."""
     else:
         category_hint = """시장 유형: 기타 Polymarket 시장.
 분석 초점: 조건문, resolution 기준, 가격 왜곡, 유동성, 변동성, 정보 부족.
@@ -674,12 +696,13 @@ def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, cat
 
     return f"""당신은 Polymarket prediction market 리스크 분석가입니다.
 LoL 전용 분석가처럼 행동하지 말고, 시장 유형에 맞는 짧은 보고서를 작성하세요.
-모르는 최신 정보·전적·뉴스·여론조사는 절대 추측하지 말고 \"데이터 없음/직접 확인 필요\"라고 쓰세요.
+모르는 최신 정보·전적·뉴스·여론조사·실시간 가격은 절대 추측하지 말고 \"데이터 없음/직접 확인 필요\"라고 쓰세요.
 이 답변은 투자 조언이 아니라 리스크 점검용입니다.
 
 시장명: {market_name}
-시장 유형/카테고리: {category}
-분류/리그/메모: {league}
+카테고리: {category}
+세부종목/분류: {subcategory}
+리그/메모: {league}
 대상 A: {team_a}
 대상 B: {team_b}
 현재 Polymarket 가격: {current_price}¢
@@ -1408,67 +1431,10 @@ with mh_r:
         st.session_state.lang = new_lang
         st.rerun()
 
+# No onboarding gate: the app opens directly with a safe default risk profile.
+# Users can adjust bankroll/risk settings later in Settings · tools.
 if st.session_state.profile is None:
-    # ---------------- ONBOARDING ----------------
-    st.markdown(f'<div class="ob-step">{t("시작하기", "Get started")}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="headline">{t("먼저 당신의 배팅 스타일을 알려주세요", "First, tell us about your betting style")}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="subline">{t("이 답변으로 당신만의 리스크 한도가 만들어지고, 모든 판독에 자동으로 적용됩니다. 나중에 설정에서 언제든 바꿀 수 있어요.", "Your answers build a personal risk profile that powers every evaluation. You can change it anytime in Settings.")}</div>', unsafe_allow_html=True)
-
-    with st.form("onboarding"):
-        st.markdown(f'<div class="eyebrow">{t("1 · 계좌", "1 · Account")}</div>', unsafe_allow_html=True)
-        o1, o2 = st.columns(2)
-        with o1:
-            ob_assets = st.number_input(t("현재 포트폴리오 총자산 ($)", "Current total assets ($)"), 1.0, value=1000.0)
-        with o2:
-            ob_start_cap = st.number_input(t("폴리마켓 시작 자금 ($)", "Starting capital ($)"), 1.0, value=1000.0)
-        ob_when = st.selectbox(t("폴리마켓을 시작한 지 얼마나 됐나요?", "How long have you been on Polymarket?"),
-                               [t("1개월 미만", "Under 1 month"), t("1~6개월", "1–6 months"),
-                                t("6개월~1년", "6–12 months"), t("1년 이상", "Over a year")])
-
-        st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("2 · 배팅 습관", "2 · Habits")}</div>', unsafe_allow_html=True)
-        ob_freq = st.selectbox(t("얼마나 자주 배팅하나요?", "How often do you bet?"),
-                               [t("거의 매일", "Almost daily"), t("주 2~3회", "2–3× a week"),
-                                t("주 1회 이하", "Weekly or less"), t("가끔, 큰 경기만", "Occasionally, big matches only")])
-        ob_cats = st.multiselect(t("주로 배팅하는 항목", "What do you usually bet on?"),
-                                 [t("LoL e스포츠", "LoL esports"), t("기타 e스포츠", "Other esports"),
-                                  t("스포츠", "Sports"), t("정치·뉴스", "Politics / news"), t("기타", "Other")],
-                                 default=[t("LoL e스포츠", "LoL esports")])
-
-        st.markdown(f'<div class="eyebrow" style="margin-top:18px;">{t("3 · 리스크 성향", "3 · Risk tolerance")}</div>', unsafe_allow_html=True)
-        ob_emotional = st.number_input(
-            t("한 번의 배팅에서 전부 잃어도 감정이 흔들리지 않는 최대 금액은? ($)",
-              "Largest single-bet loss you can take without it shaking you? ($)"),
-            1.0, value=50.0)
-        ob_max_pct = st.slider(
-            t("전체 자산 대비, 한 번에 최대 몇 %까지 배팅해도 편안한가요?",
-              "What % of your portfolio can you bet at once and still sleep well?"),
-            1, 30, 3)
-        ob_reaction = st.radio(
-            t("$200 포지션이 $100이 됐을 때, 당신은?", "Your $200 position drops to $100. You…"),
-            [t("계획대로 손절하거나 홀딩을 냉정하게 판단한다", "Calmly follow my plan — stop or hold"),
-             t("흔들리지만 규칙은 지키는 편이다", "Get shaken, but usually stick to my rules"),
-             t("복구 배팅 충동이 생기고 판단이 흐려진다", "Feel the urge to chase losses; judgment blurs")],
-            index=1)
-
-        ob_submit = st.form_submit_button(t("프로필 만들고 시작하기", "Create profile and start"), use_container_width=True)
-
-    if ob_submit:
-        reactions = [t("계획대로 손절하거나 홀딩을 냉정하게 판단한다", "Calmly follow my plan — stop or hold"),
-                     t("흔들리지만 규칙은 지키는 편이다", "Get shaken, but usually stick to my rules"),
-                     t("복구 배팅 충동이 생기고 판단이 흐려진다", "Feel the urge to chase losses; judgment blurs")]
-        mult = [4.0, 3.0, 2.0][reactions.index(ob_reaction)]
-        block = min(max(ob_max_pct * mult, 8.0), 30.0)
-        st.session_state.profile = {
-            "assets": ob_assets, "start_capital": ob_start_cap, "start_when": ob_when,
-            "freq": ob_freq, "cats": ob_cats,
-            "emotional_limit": ob_emotional,
-            "max_pct": float(ob_max_pct), "block_pct": round(block, 1),
-            "loss_reaction": ob_reaction,
-        }
-        st.rerun()
-
-    st.markdown(f'<div class="footnote">{t("진입 금지선은 [편안한 비율 × 손실 반응 계수]로 계산됩니다. 냉정할수록 더 넓은 한도를 드려요.", "Your no-entry line = comfort ratio × loss-reaction factor. The calmer you are, the wider your limit.")}</div>', unsafe_allow_html=True)
-    st.stop()
+    st.session_state.profile = dict(DEFAULT_PROFILE)
 
 # profile summary chip under masthead
 prof = profile()
@@ -1645,11 +1611,34 @@ with tab1:
         st.markdown(f'<div class="eyebrow" style="margin-top:8px;">{t("입력", "Input")}</div>', unsafe_allow_html=True)
         eb = effective_bankroll()
         with st.form("entry_form"):
-            market_name = st.text_input(t("시장 이름", "Market name"), "T1 vs HLE — Match Winner")
+            market_name = st.text_input(t("시장 이름", "Market name"), t("예: T1 vs HLE — Match Winner", "Ex: T1 vs HLE — Match Winner"))
+
+            category = st.selectbox(
+                t("시장 카테고리", "Market category"),
+                [t("e스포츠", "Esports"), t("일반 스포츠", "Sports"), t("정치", "Politics"),
+                 t("뉴스·이벤트", "News / events"), t("크립토", "Crypto"), t("기타", "Other")],
+            )
+            cat_ko = category if st.session_state.lang == "ko" else {
+                "Esports": "e스포츠", "Sports": "일반 스포츠", "Politics": "정치",
+                "News / events": "뉴스·이벤트", "Crypto": "크립토", "Other": "기타"
+            }.get(category, category)
+            sub_options = {
+                "e스포츠": ["LoL", "Valorant", "CS", "Dota", "기타 e스포츠"],
+                "일반 스포츠": ["테니스", "축구", "야구", "농구", "UFC/MMA", "기타 스포츠"],
+                "정치": ["선거", "정당/후보", "정책/법안", "기타 정치"],
+                "뉴스·이벤트": ["경제지표", "기업/인물", "국제뉴스", "기타 이벤트"],
+                "크립토": ["BTC", "ETH", "SOL", "기타 크립토"],
+                "기타": ["기타"]
+            }
+            subcategory = st.selectbox(t("세부종목/분류", "Subcategory"), sub_options.get(cat_ko, [t("기타", "Other")]))
+
+            is_match_market = cat_ko in ["e스포츠", "일반 스포츠"]
             c0a, c0b = st.columns(2)
-            with c0a: team_a = st.text_input(t("내가 보는 팀", "My team"), "T1")
-            with c0b: team_b = st.text_input(t("상대 팀", "Opponent"), "HLE")
-            league = st.selectbox(t("리그", "League"), ["LCK", "LPL", "LEC", "LCS", "MSI/Worlds", t("기타", "Other")])
+            with c0a:
+                team_a = st.text_input(t("내가 보는 팀/선수", "My team/player") if is_match_market else t("대상/결과 A", "Target/outcome A"), "T1" if is_match_market else "Yes")
+            with c0b:
+                team_b = st.text_input(t("상대 팀/선수", "Opponent") if is_match_market else t("비교대상/결과 B (선택)", "Compare/outcome B optional"), "HLE" if is_match_market else "No")
+            league = st.text_input(t("리그/메모", "League / note"), "LCK" if cat_ko == "e스포츠" else subcategory)
 
             c1, c2 = st.columns(2)
             with c1:
@@ -1701,6 +1690,7 @@ with tab1:
 
         if submitted:
             data = dict(market_name=market_name, team_a=team_a, team_b=team_b, league=league,
+                        category=category, subcategory=subcategory,
                         current_price=current_price, fair_price=fair_price, stake=stake,
                         purpose=purpose, market_type=market_type, bankroll=eb,
                         confidence=confidence, target_price=target_price, stop_price=stop_price,
@@ -1708,9 +1698,9 @@ with tab1:
                         duplicate_ml=duplicate_ml, duplicate_game=duplicate_game,
                         duplicate_side=duplicate_side, fomo_count=fomo_count)
             st.session_state.last_entry = calculate_entry(data)
-            prompt = build_prompt(team_a, team_b, league, current_price, fair_price, purpose, market_type, market_name)
+            prompt = build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category, market_name, subcategory)
             st.session_state.ai_prompt = prompt
-            st.session_state.ai_pair = f"{market_name} · {market_type}"
+            st.session_state.ai_pair = f"{market_name} · {category} / {subcategory}"
             with st.spinner(t("Claude가 시장을 분석하고 있습니다", "Claude is analyzing the market")):
                 text, err = call_claude(prompt)
             st.session_state.ai_text = text or ""
@@ -2231,8 +2221,8 @@ with tab_set:
         st.toast(t("저장했습니다", "Saved"))
         st.rerun()
 
-    if st.button(t("설문 다시 하기", "Redo questionnaire"), use_container_width=True):
-        st.session_state.profile = None
+    if st.button(t("리스크 기준 기본값으로 초기화", "Reset risk defaults"), use_container_width=True):
+        st.session_state.profile = dict(DEFAULT_PROFILE)
         st.rerun()
 
     st.markdown(
