@@ -839,8 +839,13 @@ def render_ai(text):
 # Polymarket APIs
 # =====================================================
 def extract_slug(url):
-    path = urllib.parse.urlparse(url.strip()).path.strip("/")
-    return path.split("/")[-1] if path else ""
+    """Return the last usable path segment. Supports localized Polymarket URLs like /ko/sports/mlb/<slug>."""
+    try:
+        path = urllib.parse.urlparse(str(url or "").strip()).path.strip("/")
+    except Exception:
+        return ""
+    parts = [p for p in path.split("/") if p]
+    return parts[-1] if parts else ""
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_gamma(slug):
@@ -850,54 +855,146 @@ def fetch_gamma(slug):
         return json.loads(r.read().decode("utf-8"))
 
 def parse_list(v):
-    if isinstance(v, list): return v
+    if isinstance(v, list):
+        return v
     if isinstance(v, str):
-        try: return json.loads(v)
-        except Exception: return []
+        try:
+            return json.loads(v)
+        except Exception:
+            return []
     return []
 
 
-ALLOWED_MARKET_KW = (
-    "match winner", "match-winner", "series winner", "series-winner",
-    "overall winner", "overall-winner", "game winner", "game-winner",
-    "to win", "winner", "win the match", "win this match", "win the series"
+WINNER_KW = (
+    "match winner", "match-winner", "game winner", "game-winner",
+    "series winner", "series-winner", "overall winner", "overall-winner",
+    "moneyline", "money line", "winner", "to win", "wins", "win the match",
+    "win this match", "win the game", "win the series", "will win", "which team will win"
 )
+PROP_KW = (
+    "correct score", "handicap", "spread", "over/under", "total", "o/u",
+    "points", "runs", "first to", "first map", "first inning", "margin", "exact score"
+)
+BINARY_OUTCOMES = {"yes", "no", "atl", "cws", "home", "away"}
 
 
-def is_relevant_market(question, outcome=""):
-    """Market Explorer: keep only single-match/series/overall winner style markets."""
-    s = f"{question or ''} {outcome or ''}".lower()
-    if not s.strip():
+def is_prop_market(q, outcome=""):
+    s = f"{q or ''} {outcome or ''}".lower()
+    return any(k in s for k in PROP_KW)
+
+
+def is_relevant_market(q, outcome=""):
+    """Prefer single match/series/overall winner markets. Fallback is handled in extract_markets."""
+    s = f"{q or ''} {outcome or ''}".lower()
+    if not s.strip() or is_prop_market(q, outcome):
         return False
-    # Keep broad winner markets, but avoid obviously unrelated prop/correct-score/handicap/totals markets.
-    blocked = ("correct score", "map handicap", "spread", "total maps", "total games", "over/under", "first blood", "first map", "round ")
-    if any(b in s for b in blocked):
-        return False
-    return any(k in s for k in ALLOWED_MARKET_KW)
+    return any(k in s for k in WINNER_KW)
+
+
+def _event_resolution(event, market):
+    return (
+        market.get("rules") or market.get("description") or market.get("resolutionSource") or
+        event.get("rules") or event.get("description") or event.get("resolutionSource") or ""
+    )
+
+
+def _event_volume(event, market):
+    return market.get("volume") or market.get("volumeNum") or event.get("volume") or event.get("volumeNum") or ""
+
+
+def _event_liquidity(event, market):
+    return market.get("liquidity") or market.get("liquidityNum") or event.get("liquidity") or event.get("liquidityNum") or ""
+
+
+def _event_end_date(event, market):
+    return market.get("endDate") or market.get("endDateIso") or event.get("endDate") or event.get("endDateIso") or ""
+
 
 def extract_markets(payload):
-    events = payload if isinstance(payload, list) else payload.get("events", [])
-    rows = []
+    """Extract market rows. Winner markets first; if none, fallback to binary non-prop markets."""
+    events = payload if isinstance(payload, list) else payload.get("events", []) if isinstance(payload, dict) else []
+    if not isinstance(events, list):
+        return []
+
+    all_rows, winner_rows, binary_rows = [], [], []
     for event in events:
-        for m in event.get("markets", []):
-            q = m.get("question") or m.get("title") or m.get("slug") or "Unknown"
-            outs, prices, tokens = parse_list(m.get("outcomes")), parse_list(m.get("outcomePrices")), parse_list(m.get("clobTokenIds"))
+        if not isinstance(event, dict):
+            continue
+        for m in (event.get("markets") or []):
+            if not isinstance(m, dict):
+                continue
+            q = m.get("question") or m.get("title") or m.get("slug") or event.get("title") or event.get("slug") or "Unknown"
+            outs = parse_list(m.get("outcomes"))
+            prices = parse_list(m.get("outcomePrices"))
+            tokens = parse_list(m.get("clobTokenIds"))
+            if not outs:
+                continue
+            is_binary = len(outs) == 2
             for i, o in enumerate(outs):
-                if not is_relevant_market(q, o):
-                    continue
                 price = None
                 if i < len(prices):
-                    try: price = round(float(prices[i]) * 100, 2)
-                    except Exception: price = None
-                rows.append({t("시장", "Market"): q, t("선택지", "Outcome"): o,
-                             t("현재가 (¢)", "Price (¢)"): price,
-                             "token_id": tokens[i] if i < len(tokens) else "",
-                             "volume": m.get("volume") or event.get("volume") or event.get("volumeNum") or "",
-                             "liquidity": m.get("liquidity") or event.get("liquidity") or event.get("liquidityNum") or "",
-                             "endDate": m.get("endDate") or event.get("endDate") or event.get("endDateIso") or "",
-                             "resolution": m.get("description") or m.get("rules") or event.get("description") or event.get("resolutionSource") or ""})
-    return rows
+                    try:
+                        price = round(float(prices[i]) * 100, 2)
+                    except Exception:
+                        price = None
+                row = {
+                    t("시장", "Market"): q,
+                    t("선택지", "Outcome"): o,
+                    t("현재가 (¢)", "Price (¢)"): price,
+                    "token_id": tokens[i] if i < len(tokens) else "",
+                    "volume": _event_volume(event, m),
+                    "liquidity": _event_liquidity(event, m),
+                    "endDate": _event_end_date(event, m),
+                    "resolution": _event_resolution(event, m),
+                    "_binary": is_binary,
+                    "_prop": is_prop_market(q, o),
+                }
+                all_rows.append(row)
+                if is_relevant_market(q, o):
+                    winner_rows.append(row)
+                elif is_binary and not row["_prop"]:
+                    binary_rows.append(row)
 
+    # MLB/sports pages often have simple binary markets without explicit "winner" wording.
+    if winner_rows:
+        return winner_rows
+    if binary_rows:
+        return binary_rows
+    return all_rows
+
+
+def infer_market_category(url="", name=""):
+    s = f"{url or ''} {name or ''}".lower()
+    if any(x in s for x in ["/sports/", "mlb", "nba", "nfl", "nhl", "soccer", "ufc", "tennis", "baseball", "basketball"]):
+        return t("일반 스포츠", "Sports")
+    if any(x in s for x in ["lol", "lck", "lpl", "valorant", "cs2", "dota", "esports"]):
+        return t("e스포츠", "Esports")
+    if any(x in s for x in ["election", "politic", "president", "mayor", "선거"]):
+        return t("정치", "Politics")
+    if any(x in s for x in ["crypto", "bitcoin", "btc", "ethereum", "eth", "solana", "sol"]):
+        return t("크립토", "Crypto")
+    if any(x in s for x in ["news", "event"]):
+        return t("뉴스·이벤트", "News / events")
+    return t("기타", "Other")
+
+
+def infer_market_subcategory(url="", name=""):
+    s = f"{url or ''} {name or ''}".lower()
+    if "mlb" in s or "baseball" in s:
+        return t("야구", "Baseball")
+    if "nba" in s or "basketball" in s:
+        return t("농구", "Basketball")
+    if "nfl" in s or "football" in s:
+        return t("미식축구", "Football")
+    if "soccer" in s:
+        return t("축구", "Soccer")
+    if "tennis" in s:
+        return t("테니스", "Tennis")
+    if "ufc" in s or "mma" in s:
+        return "UFC/MMA"
+    if "lol" in s or "lck" in s or "lpl" in s:
+        return "LoL"
+    return t("기타", "Other")
 
 def _escape(v):
     return html.escape(str(v or ""))
@@ -2089,7 +2186,7 @@ with tab_explore:
                     if rows:
                         st.markdown(line(t(f"{len(rows)}개 선택지를 불러왔습니다.", f"Loaded {len(rows)} outcomes."), "g"), unsafe_allow_html=True)
                     else:
-                        st.markdown(line(t("선택지를 찾지 못했습니다. /event/ URL인지 확인하세요.", "No outcomes found. Check that this is an /event/ URL."), "w"), unsafe_allow_html=True)
+                        st.markdown(line(t("선택지를 찾지 못했습니다. URL/slug 또는 Polymarket API 응답을 확인하세요.", "No outcomes found. Check the URL/slug or Polymarket API response."), "w"), unsafe_allow_html=True)
                 except Exception as e:
                     st.session_state.explore_raw = {"error": str(e)}
                     st.markdown(line(t(f"시장 정보 불러오기 실패 — {e}", f"Market fetch failed — {e}"), "b"), unsafe_allow_html=True)
@@ -2100,8 +2197,6 @@ with tab_explore:
         else:
             st.markdown(f'<div class="eyebrow">{t("시장 카드", "Market cards")}</div>', unsafe_allow_html=True)
             for i, row in enumerate(rows):
-                if not is_relevant_market(row_get(row, "시장", "Market", ""), row_get(row, "선택지", "Outcome", "")):
-                    continue
                 token = str(row.get("token_id", "") or "")
                 clob = fetch_clob_price(token) if token else {"bid": None, "ask": None, "spread": None, "raw": {}}
                 book = fetch_clob_book(token) if token else {}
@@ -2124,24 +2219,40 @@ with tab_explore:
                             "opponent": "No",
                             "current_price": max(1.0, min(99.0, price_f)),
                             "fair_price": max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f)),
-                            "category": t("기타", "Other"),
-                            "subcategory": t("기타", "Other"),
+                            "category": infer_market_category(st.session_state.explore_url, name),
+                            "subcategory": infer_market_subcategory(st.session_state.explore_url, name),
                             "note": f"token_id: {token[:16]}…" if token else "Polymarket URL",
                             "token_id": token,
                         }
                         st.toast(t("진입 판독 탭에서 확인하세요", "Check the Entry tab"))
                         st.rerun()
                 with b2:
-                    if st.button(t("AI 시장 보고서", "AI market report"), key=f"ai_report_{i}_{token}", use_container_width=True):
-                        prompt = build_prompt(outcome or name, "", "Polymarket URL", max(1.0, min(99.0, price_f)), max(1.0, min(99.0, price_f + 5 if price_f <= 94 else price_f)), t("시장 탐색", "Market explorer"), t("기타", "Other"), name, t("기타", "Other"))
+                    if st.button(t("AI 시장 보고서", "AI market report"), key=f"ai_report_{i}_{token}_{outcome}", use_container_width=True):
+                        cat = infer_market_category(st.session_state.explore_url, name)
+                        sub = infer_market_subcategory(st.session_state.explore_url, name)
+                        safe_price = max(1.0, min(99.0, price_f)) if price_f else 50.0
+                        prompt = build_prompt(
+                            outcome or name,
+                            "",
+                            "Polymarket URL",
+                            safe_price,
+                            max(1.0, min(99.0, safe_price + 5 if safe_price <= 94 else safe_price)),
+                            t("시장 탐색", "Market explorer"),
+                            cat,
+                            name,
+                            sub,
+                        )
                         prompt += (
                             f"\n\n추가 시장 데이터:"
+                            f"\n- Market URL: {st.session_state.explore_url}"
+                            f"\n- Category: {cat} / {sub}"
                             f"\n- Best bid: {clob.get('bid')}¢"
                             f"\n- Best ask: {clob.get('ask')}¢"
                             f"\n- Spread: {clob.get('spread')}¢"
                             f"\n- History change: {history_summary(hist).get('change')}¢"
-                            f"\n- Resolution: {row.get('resolution', '')}"
+                            f"\n- Resolution: {row.get('resolution', '') or '데이터 없음 / 직접 확인 필요'}"
                             f"\n- 주문 후보: {cand.get('limit_price')}¢ / {money(cand.get('max_amount', 0))}\n"
+                            f"\n주의: 최신 경기 결과, 선발/라인업/부상/뉴스 정보가 제공되지 않았으면 반드시 '데이터 없음 / 직접 확인 필요'라고 쓰세요."
                         )
                         st.session_state.explore_ai_prompt = prompt
                         st.session_state.explore_ai_pair = f"{name} · {outcome}"
