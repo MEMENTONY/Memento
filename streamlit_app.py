@@ -703,90 +703,58 @@ def get_api_key():
     return None
 
 def build_prompt(team_a, team_b, league, current_price, fair_price, purpose, category="", market_name="", subcategory="", bookmaker_prob=None, bookmaker_source_memo="", ai_extra_context=""):
-    """Strict JSON Claude prompt for clean report-card rendering.
-    Kept compatible with existing call sites.
-    """
+    """Research-focused AI prompt. App handles price/risk/math; Claude handles context/research only."""
     lang = "ko" if st.session_state.lang == "ko" else "en"
+    market_name = str(market_name or (f"{team_a} vs {team_b}" if str(team_b).strip() else team_a) or "").strip()
+    outcome = str(team_a or "").strip()
     category = str(category or t("기타", "Other")).strip()
-    subcategory = str(subcategory or "").strip()
-    market_name = str(market_name or "").strip() or (f"{team_a} vs {team_b}" if str(team_b).strip() else str(team_a).strip())
+    subcategory = str(subcategory or league or "").strip()
     current_price = float(current_price or 0)
-    fair_price = float(fair_price or current_price)
-    edge = fair_price - current_price
     cat_low = f"{category} {subcategory} {league} {market_name}".lower()
-
-    if any(k in cat_low for k in ["e스포츠", "esports", "lol", "valorant", "cs", "dota", "lck", "lpl"]):
-        domain = "sports_esports"
-        domain_fields = ["matchup_notes", "volatility", "pregame_checks", "form_data_available"]
-    elif any(k in cat_low for k in ["일반 스포츠", "스포츠", "sports", "tennis", "football", "soccer", "baseball", "mlb", "nba", "basketball", "ufc", "축구", "야구", "농구", "테니스", "격투", "mma"]):
-        domain = "sports_esports"
-        domain_fields = ["matchup_notes", "volatility", "pregame_checks", "form_data_available"]
+    sporty = any(k in cat_low for k in ["e스포츠", "esports", "sport", "스포츠", "lol", "lck", "lpl", "mlb", "nba", "nfl", "ufc", "tennis", "soccer", "baseball", "basketball"])
+    if sporty:
+        fields = '"recent_form","head_to_head","standing_or_ranking","roster_or_news"'
+        focus = "스카우팅/베팅 리서치: 최근 10경기, 상대전적, 리그순위, 폼, 로스터·부상, 시리즈/단일게임 맥락."
+        mtype = "full_match|game_map"
     elif any(k in cat_low for k in ["정치", "politic", "election", "선거", "뉴스", "news", "event", "이벤트"]):
-        domain = "politics_news"
-        domain_fields = ["resolution_basis", "sentiment_risk", "time_risk"]
-    elif any(k in cat_low for k in ["크립토", "crypto", "bitcoin", "btc", "eth", "ethereum"]):
-        domain = "crypto"
-        domain_fields = ["liquidity", "price_distortion", "volatility"]
+        fields = '"resolution_basis","time_risk","official_source","news_catalysts"'
+        focus = "정산 기준, 기간 리스크, 공식 출처, 뉴스 촉매, 유동성."
+        mtype = "politics|news"
+    elif any(k in cat_low for k in ["크립토", "crypto", "bitcoin", "btc", "eth"]):
+        fields = '"condition_definition","liquidity","volatility","news_catalysts"'
+        focus = "조건 정의, 유동성, 변동성, 촉매."
+        mtype = "crypto"
     else:
-        domain = "other"
-        domain_fields = ["condition_definition", "liquidity", "resolution_basis"]
+        fields = '"condition_definition","resolution_basis","liquidity","news_catalysts"'
+        focus = "조건 정의, 정산 기준, 유동성."
+        mtype = "other"
+    ext = str(ai_extra_context or bookmaker_source_memo or "").strip()
+    ctx_rule = (f"제공된 외부정보를 1차 근거로 사용:\n<<<{ext}>>>" if ext else "외부정보 없음. 최근 결과·전적·뉴스를 모르면 추측 금지. 모르는 항목은 missing_data에만 넣고 다른 섹션에는 반복하지 마.")
+    payload = {"name": market_name, "outcome": outcome, "category": category, "sub": subcategory, "price_cent": current_price, "purpose": purpose}
+    lang_line = "모든 값 한국어." if lang == "ko" else "All values English."
+    return f"""You are a Polymarket research analyst. Return ONLY minified valid JSON. No markdown, no code fences, no prose outside JSON.
 
-    last = st.session_state.get("last_entry", {}) if isinstance(st.session_state.get("last_entry", {}), dict) else {}
-    bankroll = last.get("bankroll", effective_bankroll())
-    ctx = {
-        "market_name": market_name,
-        "outcome_or_target": team_a,
-        "opponent_or_other_side": team_b,
-        "category": category,
-        "subcategory": subcategory,
-        "league_or_note": league,
-        "purpose": purpose,
-        "current_price_cent": current_price,
-        "fair_price_cent": fair_price,
-        "edge_cent": round(edge, 2),
-        "implied_probability": f"{current_price:.1f}%",
-        "stake": last.get("stake"),
-        "bankroll": bankroll,
-        "position_pct": last.get("position_pct"),
-        "risk_score": last.get("final_score"),
-        "recommended_cap": last.get("rec_cap"),
-        "bookmaker_probability": bookmaker_prob if bookmaker_prob not in (None, 0, 0.0, "") else None,
-        "bookmaker_source_memo": str(bookmaker_source_memo or "").strip() or None,
-        "user_extra_context_for_ai": str(ai_extra_context or "").strip() or None,
-        "decision_from_app": last.get("decision"),
-        "portfolio_count": len(st.session_state.get("portfolio", [])),
-        "auto_trade_count": len(st.session_state.get("auto_trades", [])),
-        "domain": domain,
-        "required_context_fields": domain_fields,
-    }
-    lang_line = "모든 문자열 값은 한국어로 작성." if lang == "ko" else "All string values in English."
-    schema = {
-        "verdict": "enter|wait|avoid|trim|hold",
-        "verdict_label": "short phrase",
-        "executive_summary": "2-3 sentences",
-        "market_context": {k: "string" for k in domain_fields},
-        "price_edge": {"assessment": "cheap|fair|expensive", "reasoning": "1-2 sentences", "implied_prob": "%"},
-        "risk_matrix": ["risk 1", "risk 2", "risk 3"],
-        "portfolio_impact": "2 sentences using stake/bankroll/position_pct if present",
-        "action_plan": {"action": "enter|wait|avoid|trim|hold", "max_size": "$ or %", "invalidation": "condition that voids thesis"},
-        "confidence": {"level": "high|medium|low", "basis": "why"},
-        "missing_data": ["only unknown items here; [] if none"]
-    }
-    return f"""You are a Polymarket prediction-market analyst.
-Return ONLY valid minified JSON. No markdown. No code fences. No prose outside JSON.
+MARKET={json.dumps(payload, ensure_ascii=False)}
+FOCUS={focus}
+{ctx_rule}
 
-INPUT={json.dumps(ctx, ensure_ascii=False)}
-
-JSON_SCHEMA={json.dumps(schema, ensure_ascii=False)}
+Schema(all keys required):
+{{
+"report_title":"short title",
+"market_type":"{mtype}|other",
+"research_summary":["max 3 short bullets"],
+"context_table":{{{fields}}},
+"resolution_check":"what resolves this; full match/series vs single game/map if applicable",
+"key_variables":["3-5 bullets"],
+"ai_opinion":{{"stance":"favorable|neutral|risky","reason":"context-based, not price math","what_would_change_view":"..."}},
+"missing_data":["unknown live items only; [] if none"]
+}}
 
 RULES:
-- Unknown or unavailable live info must appear ONLY in missing_data.
-- Do not repeat '데이터 없음' outside missing_data.
-- Do not invent live scores, recent results, injuries, lineups, news, polls, or prices.
-- Use current_price/fair_price/edge/risk_score/recommended_cap from INPUT for price and action logic.
-- If bookmaker_probability is null, do NOT invent betting-site odds. Put bookmaker data in missing_data.
-- If bookmaker_source_memo or user_extra_context_for_ai exists, use it as user-provided context, but do not fabricate facts beyond it.
-- Action must be practical: enter/wait/avoid/trim/hold, max_size, invalidation.
+- App already handles price/risk/bet size. Do NOT focus on edge/recommended cap/stake.
+- Mention price only as a short market-implied context if useful.
+- Unknowns go ONLY in missing_data. Do not repeat '데이터 없음' elsewhere.
+- Do not invent recent results, rankings, lineups, injuries, news, or odds.
 - {lang_line}
 """
 
@@ -891,75 +859,47 @@ def safe_json_parse(text):
 def render_ai_report_json(text):
     d = safe_json_parse(text)
     if not d:
-        return render_ai_report_text(text)
+        clean = (text or "").replace("```json", "").replace("```", "").replace("#", "").replace("---", "").strip()
+        st.markdown(f'<div class="rc-card"><div class="rc-h">{t("AI 소견","AI note")}</div>'
+                    f'<div class="rc-note">{esc(clean[:800]) if clean else t("리포트를 불러오지 못했습니다.","Report unavailable.")}</div></div>',
+                    unsafe_allow_html=True)
+        return
 
-    vk = {"enter": "g", "hold": "g", "wait": "w", "trim": "w", "avoid": "b"}.get(str(d.get("verdict", "")).lower(), "i")
-    label = d.get("verdict_label") or d.get("verdict") or t("AI 판단", "AI verdict")
-    summary = d.get("executive_summary", "")
-    st.markdown(
-        f'<div class="verdict" style="border-top:none;padding-top:6px;">'
-        f'<div class="v-title" style="font-size:28px;"><span class="dot {vk}"></span>{esc(label)}</div>'
-        f'<div class="v-sub">{esc(summary)}</div></div>',
-        unsafe_allow_html=True,
-    )
+    title = d.get("report_title", t("AI 리서치 리포트", "AI research report"))
+    op = d.get("ai_opinion", {}) or {}
+    sk = {"favorable":"g", "neutral":"w", "risky":"b"}.get(str(op.get("stance","")).lower(), "i")
+    st.markdown(f'<div class="verdict" style="border-top:none;padding-top:6px;">'
+                f'<div class="v-title" style="font-size:24px;"><span class="dot {sk}"></span>{esc(title)}</div></div>', unsafe_allow_html=True)
 
-    pe = d.get("price_edge", {}) or {}
-    ctx = d.get("market_context", {}) or {}
-    ctx_html = "".join(
-        f'<div class="rc-row"><span class="rc-k">{esc(k)}</span><span class="rc-v">{esc(v)}</span></div>'
-        for k, v in ctx.items()
-    ) or f'<div class="rc-note">{t("시장 맥락 데이터 없음", "No context data")}</div>'
+    rs = d.get("research_summary", []) or []
+    if rs:
+        st.markdown(f'<div class="rc-h" style="margin-top:8px;">{t("리서치 요약","Summary")}</div>'
+                    + "".join(line(esc(x), "i") for x in rs[:3]), unsafe_allow_html=True)
 
-    st.markdown(
-        '<div class="rc-grid">'
-        f'<div class="rc-card"><div class="rc-h">{t("가격·엣지", "Price · edge")}</div>'
-        f'<div class="rc-row"><span class="rc-k">{t("평가", "Assess")}</span><span class="rc-v">{esc(pe.get("assessment", "—"))}</span></div>'
-        f'<div class="rc-row"><span class="rc-k">implied</span><span class="rc-v">{esc(pe.get("implied_prob", "—"))}</span></div>'
-        f'<div class="rc-note">{esc(pe.get("reasoning", ""))}</div></div>'
-        f'<div class="rc-card"><div class="rc-h">{t("시장 맥락", "Context")}</div>{ctx_html}</div>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    ct = d.get("context_table", {}) or {}
+    if ct:
+        rows = "".join(f'<div class="rc-row"><span class="rc-k">{esc(k)}</span><span class="rc-v">{esc(v)}</span></div>' for k, v in ct.items() if v)
+        st.markdown(f'<div class="rc-card" style="margin-top:10px;"><div class="rc-h">{t("맥락 데이터","Context")}</div>{rows}</div>', unsafe_allow_html=True)
 
-    risks = d.get("risk_matrix", []) or []
-    if risks:
-        st.markdown(
-            f'<div class="rc-h" style="margin-top:14px;">{t("주요 리스크", "Key risks")}</div>'
-            + "".join(line(esc(x), "w") for x in risks),
-            unsafe_allow_html=True,
-        )
+    if d.get("resolution_check"):
+        st.markdown(f'<div class="rc-card" style="margin-top:10px;"><div class="rc-h">{t("정산 조건","Resolution")}</div>'
+                    f'<div class="rc-note">{esc(d.get("resolution_check", ""))}</div></div>', unsafe_allow_html=True)
 
-    if d.get("portfolio_impact"):
-        st.markdown(
-            f'<div class="rc-card" style="margin-top:12px;"><div class="rc-h">{t("포트폴리오 영향", "Portfolio impact")}</div>'
-            f'<div class="rc-note">{esc(d.get("portfolio_impact", ""))}</div></div>',
-            unsafe_allow_html=True,
-        )
+    kv = d.get("key_variables", []) or []
+    if kv:
+        st.markdown(f'<div class="rc-h" style="margin-top:12px;">{t("핵심 변수","Key variables")}</div>'
+                    + "".join(line(esc(x), "w") for x in kv), unsafe_allow_html=True)
 
-    ap = d.get("action_plan", {}) or {}
-    st.markdown(
-        f'<div class="rc-action"><div class="rc-h">{t("행동 계획", "Action plan")}</div>'
-        f'<div class="rc-row"><span class="rc-k">{t("행동", "Action")}</span><span class="rc-v"><b>{esc(ap.get("action", "—"))}</b></span></div>'
-        f'<div class="rc-row"><span class="rc-k">{t("최대 크기", "Max size")}</span><span class="rc-v">{esc(ap.get("max_size", "—"))}</span></div>'
-        f'<div class="rc-row"><span class="rc-k">{t("무효 조건", "Invalidation")}</span><span class="rc-v">{esc(ap.get("invalidation", "—"))}</span></div></div>',
-        unsafe_allow_html=True,
-    )
-
-    cf = d.get("confidence", {}) or {}
-    ck = {"high": "g", "medium": "w", "low": "b"}.get(str(cf.get("level", "")).lower(), "i")
-    st.markdown(
-        f'<div style="margin-top:12px;"><span class="state {ck}">{t("신뢰도", "Confidence")}: {esc(cf.get("level", "—"))}</span> '
-        f'<span class="rc-note">{esc(cf.get("basis", ""))}</span></div>',
-        unsafe_allow_html=True,
-    )
+    if op:
+        st.markdown(f'<div class="rc-action"><div class="rc-h">{t("AI 소견","AI opinion")}</div>'
+                    f'<div class="rc-row"><span class="rc-k">{t("입장","Stance")}</span><span class="rc-v"><b>{esc(op.get("stance", "—"))}</b></span></div>'
+                    f'<div class="rc-note">{esc(op.get("reason", ""))}</div>'
+                    f'<div class="rc-note" style="color:var(--gray);">{t("관점이 바뀌는 조건","Would change view")}: {esc(op.get("what_would_change_view", "—"))}</div></div>', unsafe_allow_html=True)
 
     md = d.get("missing_data", []) or []
     if md:
-        st.markdown(
-            f'<div class="rc-missing"><div class="rc-h">{t("확인 필요 데이터", "Verify manually")}</div>'
-            + "".join(f"<div>· {esc(x)}</div>" for x in md) + "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="rc-missing"><div class="rc-h">{t("확인 필요 데이터","Verify manually")}</div>'
+                    + "".join(f"<div>· {esc(x)}</div>" for x in md) + '</div>', unsafe_allow_html=True)
 
 
 def render_ai(text):
@@ -997,34 +937,32 @@ def parse_list(v):
 
 
 P1_KW = (
-    "moneyline", "money line",
-    "match winner", "match-winner",
-    "series winner", "series-winner",
-    "overall winner", "overall-winner",
-    "to win", "winner", "will win", "wins",
-    "win the match", "win this match", "win the series",
+    "moneyline", "match winner", "match-winner", "series winner", "series-winner",
+    "overall winner", "series result", "match result", "to win the match",
+    "will win the match", "to win the series", "win the match", "win this match", "win the series"
 )
 P2_KW = (
-    "game winner", "game-winner", "map winner", "map-winner",
-    "win the game", "game 1 winner", "game 2 winner", "game 3 winner", "map 1 winner", "map 2 winner",
+    "game winner", "map winner", "game 1", "game 2", "game 3", "game 4", "game 5",
+    "map 1", "map 2", "map 3", "game-winner", "map-winner", "win the game"
 )
 PROP_KW = (
-    "first blood", "handicap", "spread", "total", "over/under", "o/u",
-    "correct score", "kills", "kill", "towers", "tower", "dragon", "baron",
-    "map score", "inhibitor", "first to", "points", "margin", "exact score",
-    "first map", "first inning",
+    "first blood", "first tower", "first dragon", "first baron", "kills", "kill", "towers",
+    "tower", "dragon", "baron", "handicap", "spread", "total", "over/under", "o/u",
+    "correct score", "map score", "series score", "exact score", "duration",
+    "objectives", "inhibitor", "first to", "points", "margin", "player props"
 )
 
 
 def classify_market_type(question, outcome="", category=""):
-    """Classify Polymarket markets. P1 full winner first, P2 game/map winner second, props excluded."""
-    s = f"{category or ''} {question or ''} {outcome or ''}".lower()
+    s = f"{question or ''} {outcome or ''} {category or ''}".lower()
     if any(k in s for k in PROP_KW):
         return "prop"
     if any(k in s for k in P2_KW):
         return "p2_game"
     if any(k in s for k in P1_KW):
-        return "p1_winner"
+        return "p1_main"
+    if "winner" in s or "to win" in s:
+        return "p1_main"
     return "other"
 
 
@@ -1034,19 +972,11 @@ def is_prop_market(q, outcome=""):
 
 def is_relevant_market(q, outcome="", event_title=""):
     cls = classify_market_type(f"{event_title or ''} {q or ''}", outcome)
-    return cls in ("p1_winner", "p2_game")
-
-
-def is_binary_winner_fallback(q, outcome=""):
-    """Fallback for full-game moneyline pages that expose only two outcomes without winner wording."""
-    return not is_prop_market(q, outcome)
+    return cls in ("p1_main", "p2_game")
 
 
 def _event_resolution(event, market):
-    return (
-        market.get("rules") or market.get("description") or market.get("resolutionSource") or
-        event.get("rules") or event.get("description") or event.get("resolutionSource") or ""
-    )
+    return (market.get("rules") or market.get("description") or market.get("resolutionSource") or event.get("rules") or event.get("description") or event.get("resolutionSource") or "")
 
 
 def _event_volume(event, market):
@@ -1062,17 +992,16 @@ def _event_end_date(event, market):
 
 
 def extract_markets(payload, category=""):
-    """P1 full winner first, then P2 game/map winner. Props never shown. Fallback: binary non-prop."""
     events = payload if isinstance(payload, list) else payload.get("events", []) if isinstance(payload, dict) else []
     if not isinstance(events, list):
         return []
-
-    p1_rows, p2_rows, binary_rows = [], [], []
+    p1, p2, binary = [], [], []
+    seen = set()
     for event in events:
         if not isinstance(event, dict):
             continue
         event_title = event.get("title") or event.get("slug") or ""
-        for m in (event.get("markets") or []):
+        for m in event.get("markets", []) or []:
             if not isinstance(m, dict):
                 continue
             q = m.get("question") or m.get("title") or m.get("slug") or event_title or "Unknown"
@@ -1081,7 +1010,7 @@ def extract_markets(payload, category=""):
             tokens = parse_list(m.get("clobTokenIds"))
             if not outs:
                 continue
-            is_binary = len(outs) == 2
+            is_bin = len(outs) == 2
             cls = classify_market_type(f"{event_title} {q}", "", category)
             if cls == "prop":
                 continue
@@ -1092,44 +1021,26 @@ def extract_markets(payload, category=""):
                         price = round(float(prices[i]) * 100, 2)
                     except Exception:
                         price = None
-                row = {
-                    t("시장", "Market"): q,
-                    t("선택지", "Outcome"): o,
-                    t("현재가 (¢)", "Price (¢)"): price,
-                    "token_id": tokens[i] if i < len(tokens) else "",
-                    "volume": _event_volume(event, m),
-                    "liquidity": _event_liquidity(event, m),
-                    "endDate": _event_end_date(event, m),
-                    "resolution": _event_resolution(event, m),
-                    "event_title": event_title,
-                    "_binary": is_binary,
-                    "_class": cls,
-                }
-                if cls == "p1_winner":
-                    p1_rows.append(row)
+                row = {t("시장", "Market"): q, t("선택지", "Outcome"): o,
+                       t("현재가 (¢)", "Price (¢)"): price,
+                       "token_id": tokens[i] if i < len(tokens) else "",
+                       "volume": _event_volume(event, m), "liquidity": _event_liquidity(event, m),
+                       "endDate": _event_end_date(event, m), "resolution": _event_resolution(event, m),
+                       "event_title": event_title, "market_class": cls, "_binary": is_bin}
+                key = (row[t("시장", "Market")], row[t("선택지", "Outcome")], row.get("token_id"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if cls == "p1_main":
+                    p1.append(row)
                 elif cls == "p2_game":
-                    p2_rows.append(row)
-                if is_binary and is_binary_winner_fallback(q, o):
-                    binary_rows.append(row)
-
-    ordered = p1_rows + p2_rows
-    if ordered:
-        merged, seen = [], set()
-        for r in ordered:
-            key = (r.get(t("시장", "Market")), r.get(t("선택지", "Outcome")), r.get("token_id"))
-            if key not in seen:
-                seen.add(key)
-                merged.append(r)
-        return merged
-    if binary_rows:
-        merged, seen = [], set()
-        for r in binary_rows:
-            key = (r.get(t("시장", "Market")), r.get(t("선택지", "Outcome")), r.get("token_id"))
-            if key not in seen:
-                seen.add(key)
-                merged.append(r)
-        return merged
-    return []
+                    p2.append(row)
+                elif is_bin:
+                    row["market_class"] = "fallback_binary"
+                    binary.append(row)
+    if p1 or p2:
+        return p1 + p2
+    return binary
 
 
 def infer_market_category(url="", name=""):
@@ -1604,12 +1515,10 @@ def render_profile_pnl_dashboard(pnl):
   <div class='profile-grid'>
     <div class='profile-cell'><div class='k'>{t('현재 포지션 가치', 'Position value')}</div><div class='v'>{money(pnl.get('position_value', 0))}</div></div>
     <div class='profile-cell'><div class='k'>{t('지갑 총자산', 'Wallet assets')}</div><div class='v'>{money(pnl.get('wallet_assets', 0))}</div></div>
-    <div class='profile-cell'><div class='k'>{t('미실현손익', 'Unrealized P&L')}</div><div class='v {un_tone}'>{signed_money(pnl.get('unrealized', 0))}</div></div>
     <div class='profile-cell'><div class='k'>{t('출금보정 누적손익', 'Cashflow-adjusted P&L')}</div><div class='v {adj_tone}'>{signed_money(pnl.get('adjusted_profit', 0))}</div></div>
     <div class='profile-cell'><div class='k'>{t('보정 수익률', 'Adjusted ROI')}</div><div class='v {adj_tone}'>{roi_text}</div></div>
     <div class='profile-cell'><div class='k'>{t('올해 손익', 'Year P&L')}</div><div class='v {yr_tone}'>{signed_money(pnl.get('year_pnl', 0))}</div></div>
     <div class='profile-cell'><div class='k'>realizedPnl</div><div class='v'>{signed_money(pnl.get('realized_pnl', 0))}</div></div>
-    <div class='profile-cell'><div class='k'>cashPnl</div><div class='v'>{signed_money(pnl.get('cash_pnl', 0))}</div></div>
   </div>
   <div class='sub' style='margin-top:14px;'>{t('Polymarket 프로필 화면과 소액 차이가 날 수 있습니다. 출금·입금·정산·dust 포지션은 보정값과 API 필드에 따라 달라집니다.', 'This can differ slightly from the Polymarket profile due to withdrawals, deposits, settlements and dust positions.')}</div>
 </div>"""
@@ -2955,8 +2864,7 @@ with tab_pf:
         '<div class="stats">'
         + stat(t("현재 총자산", "Total assets"), money(total_assets), t("현금 + 평가금", "Cash + value"))
         + stat(t("현금", "Cash"), money(cash), t("직접 입력", "Manual input"))
-        + stat(t("포지션 평가금", "Position value"), money(pos_value), t(f"{len(st.session_state.portfolio)}개 보유", f"{len(st.session_state.portfolio)} holdings"))
-        + stat(t("미실현손익", "Unrealized"), signed_money(unrealized), signed_pct(unrealized / pos_cost * 100 if pos_cost else 0), "pos" if unrealized >= 0 else "neg")
+        + stat(t("포지션 평가금", "Position value"), money(pos_value), t(f"원금 {money(pos_cost)}", f"cost {money(pos_cost)}"))
         + "</div>"
         + '<div class="stats">'
         + stat(t("앱 기록 실현손익", "App-recorded realized"), signed_money(realized_total), t("거래일지 + 올해 보정", "Journal + yearly adjustment"), "pos" if realized_total >= 0 else "neg")
